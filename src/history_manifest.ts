@@ -1,0 +1,260 @@
+import {
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  SEPARATOR,
+} from "https://deno.land/std@0.224.0/path/mod.ts";
+import { parseUtcDate } from "./date.ts";
+import { sha256Hex } from "./model.ts";
+import type { EventRecord } from "./model.ts";
+import {
+  DEFAULT_MAX_SOURCE_BYTES,
+  DEFAULT_MINIMUM_EVENT_COUNT,
+  EVENTS_SOURCE_URL,
+  parseEventsDocument,
+  readJsonResponse,
+} from "./source.ts";
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const SAFE_RELATIVE_FILE_PATTERN = /^[a-zA-Z0-9._/-]+$/u;
+const MAX_MANIFEST_SNAPSHOTS = 5_000;
+const MAX_ETAG_BYTES = 1_024;
+
+export interface HistoricalSnapshotManifestEntry {
+  readonly date: string;
+  readonly fetchedAt: string;
+  readonly file: string;
+  readonly sha256: string;
+  readonly etag: string | null;
+}
+
+export interface HistoricalSnapshotManifest {
+  readonly formatVersion: 1;
+  readonly sourceUrl: typeof EVENTS_SOURCE_URL;
+  readonly snapshots: readonly HistoricalSnapshotManifestEntry[];
+}
+
+export interface HistoricalSnapshot extends HistoricalSnapshotManifestEntry {
+  readonly sourceSha256: string;
+  readonly events: readonly EventRecord[];
+}
+
+export interface ReadHistoricalSnapshotOptions {
+  readonly minimumEventCount?: number;
+  readonly maximumBytes?: number;
+  readonly readFile?: (path: string) => Promise<Uint8Array>;
+}
+
+export class HistoricalSnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HistoricalSnapshotError";
+  }
+}
+
+export function parseHistoricalSnapshotManifest(
+  input: unknown,
+): HistoricalSnapshotManifest {
+  const root = recordValue(input, "Snapshot manifest");
+  assertExactKeys(
+    root,
+    ["formatVersion", "sourceUrl", "snapshots"],
+    "Snapshot manifest",
+  );
+  if (root.formatVersion !== 1) {
+    throw new HistoricalSnapshotError(
+      "Snapshot manifest formatVersion must be 1",
+    );
+  }
+  if (root.sourceUrl !== EVENTS_SOURCE_URL) {
+    throw new HistoricalSnapshotError(
+      `Snapshot manifest sourceUrl must be ${EVENTS_SOURCE_URL}`,
+    );
+  }
+  if (
+    !Array.isArray(root.snapshots) || root.snapshots.length < 1 ||
+    root.snapshots.length > MAX_MANIFEST_SNAPSHOTS
+  ) {
+    throw new HistoricalSnapshotError(
+      `Snapshot manifest must contain 1 through ${MAX_MANIFEST_SNAPSHOTS} snapshots`,
+    );
+  }
+
+  const snapshots = root.snapshots.map(parseManifestEntry);
+  for (let index = 1; index < snapshots.length; index += 1) {
+    if (snapshots[index - 1]!.date >= snapshots[index]!.date) {
+      throw new HistoricalSnapshotError(
+        "Snapshot dates must be strictly increasing",
+      );
+    }
+  }
+
+  return {
+    formatVersion: 1,
+    sourceUrl: EVENTS_SOURCE_URL,
+    snapshots,
+  };
+}
+
+export async function readHistoricalSnapshot(
+  manifestPath: string,
+  entry: HistoricalSnapshotManifestEntry,
+  options: ReadHistoricalSnapshotOptions = {},
+): Promise<HistoricalSnapshot> {
+  const filePath = resolveSnapshotPath(manifestPath, entry.file);
+  const bytes = await (options.readFile ?? Deno.readFile)(filePath);
+  const maximumBytes = options.maximumBytes ?? DEFAULT_MAX_SOURCE_BYTES;
+  if (bytes.byteLength > maximumBytes) {
+    throw new HistoricalSnapshotError(
+      `Snapshot ${entry.file} exceeds ${maximumBytes} bytes`,
+    );
+  }
+  const sourceSha256 = await sha256Hex(bytes);
+  if (sourceSha256 !== entry.sha256) {
+    throw new HistoricalSnapshotError(
+      `Snapshot ${entry.file} hash does not match its manifest`,
+    );
+  }
+
+  const document = await readJsonResponse(
+    new Response(Uint8Array.from(bytes).buffer, {
+      headers: { "content-type": "application/json" },
+    }),
+    maximumBytes,
+  );
+  const events = parseEventsDocument(document, {
+    minimumEventCount: options.minimumEventCount ??
+      DEFAULT_MINIMUM_EVENT_COUNT,
+  });
+  return { ...entry, sourceSha256, events };
+}
+
+export async function readHistoricalSnapshotManifest(
+  manifestPath: string,
+  readTextFile: (path: string) => Promise<string> = Deno.readTextFile,
+): Promise<HistoricalSnapshotManifest> {
+  let input: unknown;
+  try {
+    input = JSON.parse(await readTextFile(manifestPath));
+  } catch (error) {
+    throw new HistoricalSnapshotError(
+      error instanceof SyntaxError
+        ? "Snapshot manifest is not valid JSON"
+        : `Could not read snapshot manifest: ${errorMessage(error)}`,
+    );
+  }
+  return parseHistoricalSnapshotManifest(input);
+}
+
+function parseManifestEntry(
+  input: unknown,
+  index: number,
+): HistoricalSnapshotManifestEntry {
+  const label = `Snapshot manifest entry ${index}`;
+  const record = recordValue(input, label);
+  assertExactKeys(
+    record,
+    ["date", "fetchedAt", "file", "sha256", "etag"],
+    label,
+  );
+  if (typeof record.date !== "string") {
+    throw new HistoricalSnapshotError(`${label} date must be a string`);
+  }
+  let date: string;
+  try {
+    date = parseUtcDate(record.date);
+  } catch {
+    throw new HistoricalSnapshotError(`${label} date is invalid`);
+  }
+  if (typeof record.fetchedAt !== "string") {
+    throw new HistoricalSnapshotError(`${label} fetchedAt must be a string`);
+  }
+  const fetched = new Date(record.fetchedAt);
+  if (Number.isNaN(fetched.getTime())) {
+    throw new HistoricalSnapshotError(`${label} fetchedAt is invalid`);
+  }
+  const fetchedAt = fetched.toISOString();
+  if (fetchedAt.slice(0, 10) !== date) {
+    throw new HistoricalSnapshotError(
+      `${label} fetchedAt must fall on its UTC observation date`,
+    );
+  }
+  if (
+    typeof record.file !== "string" || record.file.length < 1 ||
+    record.file.length > 1_024 ||
+    !SAFE_RELATIVE_FILE_PATTERN.test(record.file) ||
+    isAbsolute(record.file) ||
+    record.file.split(/[\\/]/u).some((part) => part === ".." || part === "")
+  ) {
+    throw new HistoricalSnapshotError(
+      `${label} file must be a safe relative file path`,
+    );
+  }
+  if (
+    typeof record.sha256 !== "string" || !SHA256_PATTERN.test(record.sha256)
+  ) {
+    throw new HistoricalSnapshotError(`${label} sha256 is invalid`);
+  }
+  if (
+    record.etag !== null &&
+    (typeof record.etag !== "string" ||
+      new TextEncoder().encode(record.etag).byteLength > MAX_ETAG_BYTES)
+  ) {
+    throw new HistoricalSnapshotError(`${label} etag is invalid`);
+  }
+
+  return {
+    date,
+    fetchedAt,
+    file: record.file,
+    sha256: record.sha256,
+    etag: record.etag,
+  };
+}
+
+function resolveSnapshotPath(manifestPath: string, file: string): string {
+  const base = dirname(resolve(manifestPath));
+  const candidate = resolve(base, file);
+  const relativePath = relative(base, candidate);
+  if (
+    relativePath === ".." || relativePath.startsWith(`..${SEPARATOR}`) ||
+    isAbsolute(relativePath)
+  ) {
+    throw new HistoricalSnapshotError(
+      "Snapshot file must remain inside the manifest directory",
+    );
+  }
+  return candidate;
+}
+
+function recordValue(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new HistoricalSnapshotError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  allowed: readonly string[],
+  label: string,
+): void {
+  const allowedKeys = new Set(allowed);
+  const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unknown.length > 0) {
+    throw new HistoricalSnapshotError(
+      `${label} contains unknown field ${unknown[0]}`,
+    );
+  }
+  const missing = allowed.filter((key) => !(key in value));
+  if (missing.length > 0) {
+    throw new HistoricalSnapshotError(
+      `${label} is missing field ${missing[0]}`,
+    );
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "unknown error";
+}
