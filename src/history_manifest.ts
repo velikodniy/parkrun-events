@@ -1,10 +1,4 @@
-import {
-  dirname,
-  isAbsolute,
-  relative,
-  resolve,
-  SEPARATOR,
-} from "https://deno.land/std@0.224.0/path/mod.ts";
+import { dirname, isAbsolute, relative, resolve, SEPARATOR } from "@std/path";
 import { parseUtcDate } from "./date.ts";
 import { sha256Hex } from "./model.ts";
 import type { EventRecord } from "./model.ts";
@@ -19,6 +13,7 @@ import {
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const SAFE_RELATIVE_FILE_PATTERN = /^[a-zA-Z0-9._/-]+$/u;
 const MAX_MANIFEST_SNAPSHOTS = 5_000;
+const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ETAG_BYTES = 1_024;
 
 export interface HistoricalSnapshotManifestEntry {
@@ -44,6 +39,7 @@ export interface ReadHistoricalSnapshotOptions {
   readonly minimumEventCount?: number;
   readonly maximumBytes?: number;
   readonly readFile?: (path: string) => Promise<Uint8Array>;
+  readonly realPath?: (path: string) => Promise<string>;
 }
 
 export class HistoricalSnapshotError extends Error {
@@ -102,7 +98,11 @@ export async function readHistoricalSnapshot(
   entry: HistoricalSnapshotManifestEntry,
   options: ReadHistoricalSnapshotOptions = {},
 ): Promise<HistoricalSnapshot> {
-  const filePath = resolveSnapshotPath(manifestPath, entry.file);
+  const filePath = await resolveSnapshotPath(
+    manifestPath,
+    entry.file,
+    options.realPath ?? Deno.realPath,
+  );
   const bytes = await (options.readFile ?? Deno.readFile)(filePath);
   const maximumBytes = options.maximumBytes ?? DEFAULT_MAX_SOURCE_BYTES;
   if (bytes.byteLength > maximumBytes) {
@@ -134,17 +134,23 @@ export async function readHistoricalSnapshotManifest(
   manifestPath: string,
   readTextFile: (path: string) => Promise<string> = Deno.readTextFile,
 ): Promise<HistoricalSnapshotManifest> {
-  let input: unknown;
+  let text: string;
   try {
-    input = JSON.parse(await readTextFile(manifestPath));
+    text = await readTextFile(manifestPath);
   } catch (error) {
     throw new HistoricalSnapshotError(
-      error instanceof SyntaxError
-        ? "Snapshot manifest is not valid JSON"
-        : `Could not read snapshot manifest: ${errorMessage(error)}`,
+      `Could not read snapshot manifest: ${errorMessage(error)}`,
     );
   }
-  return parseHistoricalSnapshotManifest(input);
+  if (new TextEncoder().encode(text).byteLength > MAX_MANIFEST_BYTES) {
+    throw new HistoricalSnapshotError("Snapshot manifest is too large");
+  }
+  try {
+    return parseHistoricalSnapshotManifest(JSON.parse(text));
+  } catch (error) {
+    if (error instanceof HistoricalSnapshotError) throw error;
+    throw new HistoricalSnapshotError("Snapshot manifest is not valid JSON");
+  }
 }
 
 function parseManifestEntry(
@@ -213,19 +219,40 @@ function parseManifestEntry(
   };
 }
 
-function resolveSnapshotPath(manifestPath: string, file: string): string {
-  const base = dirname(resolve(manifestPath));
-  const candidate = resolve(base, file);
+async function resolveSnapshotPath(
+  manifestPath: string,
+  file: string,
+  realPath: (path: string) => Promise<string>,
+): Promise<string> {
+  const lexicalBase = dirname(resolve(manifestPath));
+  const lexicalCandidate = resolve(lexicalBase, file);
+  assertContainedPath(lexicalBase, lexicalCandidate);
+  let base: string;
+  let candidate: string;
+  try {
+    [base, candidate] = await Promise.all([
+      realPath(lexicalBase),
+      realPath(lexicalCandidate),
+    ]);
+  } catch (error) {
+    throw new HistoricalSnapshotError(
+      `Could not resolve snapshot file: ${errorMessage(error)}`,
+    );
+  }
+  assertContainedPath(base, candidate);
+  return candidate;
+}
+
+function assertContainedPath(base: string, candidate: string): void {
   const relativePath = relative(base, candidate);
   if (
     relativePath === ".." || relativePath.startsWith(`..${SEPARATOR}`) ||
     isAbsolute(relativePath)
   ) {
     throw new HistoricalSnapshotError(
-      "Snapshot file must remain inside the manifest directory",
+      "Snapshot file resolves outside the manifest directory",
     );
   }
-  return candidate;
 }
 
 function recordValue(value: unknown, label: string): Record<string, unknown> {

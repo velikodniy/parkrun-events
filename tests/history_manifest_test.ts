@@ -3,6 +3,7 @@ import {
   HistoricalSnapshotError,
   parseHistoricalSnapshotManifest,
   readHistoricalSnapshot,
+  readHistoricalSnapshotManifest,
 } from "../src/history_manifest.ts";
 import { sha256Hex } from "../src/model.ts";
 import { eventFeature, eventsDocument } from "./fixtures/events.ts";
@@ -74,6 +75,18 @@ Deno.test("snapshot manifests reject unsafe file paths and unknown fields", () =
   );
 });
 
+Deno.test("snapshot manifests bound input size", async () => {
+  await assertRejects(
+    () =>
+      readHistoricalSnapshotManifest(
+        "manifest.json",
+        () => Promise.resolve(" ".repeat(1_100_000)),
+      ),
+    HistoricalSnapshotError,
+    "too large",
+  );
+});
+
 Deno.test("snapshot files are hash-checked and source-validated", async () => {
   const bytes = new TextEncoder().encode(JSON.stringify(eventsDocument([
     eventFeature(1, "one"),
@@ -94,6 +107,7 @@ Deno.test("snapshot files are hash-checked and source-validated", async () => {
         requestedPath = path;
         return Promise.resolve(bytes);
       },
+      realPath: (path) => Promise.resolve(path),
     },
   );
 
@@ -109,9 +123,28 @@ Deno.test("snapshot files are hash-checked and source-validated", async () => {
         {
           minimumEventCount: 1,
           readFile: () => Promise.resolve(bytes),
+          realPath: (path) => Promise.resolve(path),
         },
       ),
     HistoricalSnapshotError,
     "hash",
+  );
+
+  await assertRejects(
+    () =>
+      readHistoricalSnapshot(
+        "history/manifest.json",
+        parsed.snapshots[0]!,
+        {
+          minimumEventCount: 1,
+          readFile: () => Promise.resolve(bytes),
+          realPath: (path) =>
+            Promise.resolve(
+              path.endsWith("/history") ? path : "/outside/snapshot.json",
+            ),
+        },
+      ),
+    HistoricalSnapshotError,
+    "outside",
   );
 });
