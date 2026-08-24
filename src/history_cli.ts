@@ -116,7 +116,10 @@ export function validateProductionDatabaseUrl(value: string): string {
     url.protocol !== "https:" || url.hostname !== "api.deno.com" ||
     url.port !== "" || url.username !== "" || url.password !== "" ||
     url.search !== "" || url.hash !== "" ||
-    !/^\/v2\/databases\/[^/]+\/connect\/?$/u.test(url.pathname)
+    !/^\/v2\/databases\/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\/connect\/?$/iu
+      .test(
+        url.pathname,
+      )
   ) {
     throw invalidDatabaseUrl();
   }
@@ -284,6 +287,6 @@ function uniqueOptionValue(
 
 function invalidDatabaseUrl(): TypeError {
   return new TypeError(
-    "Expected a production Deno KV connector URL at https://api.deno.com/v2/databases/<id>/connect",
+    "Expected a production Deno KV connector URL at https://api.deno.com/v2/databases/<uuid>/connect",
   );
 }

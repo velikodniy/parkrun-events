@@ -1,11 +1,12 @@
 import { assertEquals, assertExists } from "@std/assert";
 import { getIntrospectionQuery } from "graphql";
+import { ChangeReadModel } from "../src/change_views.ts";
 import { createGraphqlServer } from "../src/graphql.ts";
 import { KvArchive } from "../src/kv_archive.ts";
 import { buildRevision, diffRevisions } from "../src/model.ts";
 import type { EventRecord } from "../src/model.ts";
 
-function event(id: number, slug: string): EventRecord {
+function event(id: number, slug: string, countryCode = 97): EventRecord {
   return {
     id,
     slug,
@@ -15,8 +16,10 @@ function event(id: number, slug: string): EventRecord {
     location: `${slug} park`,
     latitude: 51,
     longitude: -1,
-    countryCode: 97,
-    countryUrl: "https://www.parkrun.org.uk",
+    countryCode,
+    countryUrl: countryCode === 97
+      ? "https://www.parkrun.org.uk"
+      : "https://www.parkrun.example",
     seriesId: 1,
   };
 }
@@ -341,6 +344,212 @@ Deno.test("GraphQL paginates change sets with an opaque cursor", async () => {
     const secondPageInfo = secondConnection.pageInfo as Record<string, unknown>;
     assertEquals(secondPageInfo.hasNextPage, false);
     assertExists(secondPageInfo.endCursor);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GraphQL change views default to all countries and expose event history", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    await publish(
+      archive,
+      [event(1, "one"), event(2, "two", 3)],
+      "2026-08-01",
+    );
+    await publish(
+      archive,
+      [event(1, "one-moved", 3), event(3, "three")],
+      "2026-08-02",
+    );
+    const views = new ChangeReadModel(kv);
+    await views.synchronize(archive, { apply: true });
+    const server = createGraphqlServer(archive, views);
+
+    assertEquals(
+      await execute(
+        server,
+        `
+        query Changes($countryCode: Int) {
+          catalogueChanges(countryCode: $countryCode) {
+            nodes {
+              counts { appeared disappeared updated }
+              appeared { nodes { after { id countryCode } } }
+              disappeared { nodes { before { id countryCode } } }
+              updated {
+                nodes {
+                  before { id countryCode }
+                  after { id countryCode }
+                }
+              }
+            }
+          }
+        }
+      `,
+      ),
+      {
+        data: {
+          catalogueChanges: {
+            nodes: [{
+              counts: { appeared: 1, disappeared: 1, updated: 1 },
+              appeared: { nodes: [{ after: { id: 3, countryCode: 97 } }] },
+              disappeared: {
+                nodes: [{ before: { id: 2, countryCode: 3 } }],
+              },
+              updated: {
+                nodes: [{
+                  before: { id: 1, countryCode: 97 },
+                  after: { id: 1, countryCode: 3 },
+                }],
+              },
+            }],
+          },
+        },
+      },
+    );
+
+    assertEquals(
+      await execute(
+        server,
+        `
+        query {
+          catalogueChanges(countryCode: 3) {
+            nodes {
+              counts { appeared disappeared updated }
+            }
+          }
+          eventChanges(eventId: 1) {
+            nodes {
+              kind
+              observation { date }
+              previousObservation { date }
+              before { slug countryCode }
+              after { slug countryCode }
+              changedFields
+              confirmedAnomaly
+            }
+          }
+        }
+      `,
+      ),
+      {
+        data: {
+          catalogueChanges: {
+            nodes: [{
+              counts: { appeared: 0, disappeared: 1, updated: 1 },
+            }],
+          },
+          eventChanges: {
+            nodes: [{
+              kind: "UPDATED",
+              observation: { date: "2026-08-02" },
+              previousObservation: { date: "2026-08-01" },
+              before: { slug: "one", countryCode: 97 },
+              after: { slug: "one-moved", countryCode: 3 },
+              changedFields: [
+                "SLUG",
+                "NAME",
+                "SHORT_NAME",
+                "LOCATION",
+                "COUNTRY",
+              ],
+              confirmedAnomaly: false,
+            }],
+          },
+        },
+      },
+    );
+
+    assertEquals(
+      await execute(
+        server,
+        `
+        query {
+          all: catalogueChanges {
+            nodes { appeared { nodes { id } } }
+          }
+          country: catalogueChanges(countryCode: 3) {
+            nodes { appeared { nodes { id } } }
+          }
+        }
+      `,
+      ),
+      {
+        data: {
+          all: { nodes: [{ appeared: { nodes: [{ id: 3 }] } }] },
+          country: { nodes: [{ appeared: { nodes: [] } }] },
+        },
+      },
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GraphQL event-history cursors are scoped to one event", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    await publish(archive, [event(1, "one")], "2026-08-01");
+    await publish(archive, [event(1, "two")], "2026-08-02");
+    await publish(archive, [event(1, "three")], "2026-08-03");
+    const views = new ChangeReadModel(kv);
+    await views.synchronize(archive, { apply: true });
+    const server = createGraphqlServer(archive, views);
+    const query = `
+      query History($eventId: Int!, $after: String) {
+        eventChanges(eventId: $eventId, first: 1, after: $after) {
+          nodes { after { slug } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    `;
+    const first = await execute(server, query, { eventId: 1 });
+    const connection = (first.data as Record<string, unknown>)
+      .eventChanges as Record<string, unknown>;
+    assertEquals(connection.nodes, [{ after: { slug: "two" } }]);
+    const pageInfo = connection.pageInfo as Record<string, unknown>;
+    assertEquals(pageInfo.hasNextPage, true);
+    assertExists(pageInfo.endCursor);
+
+    const second = await execute(server, query, {
+      eventId: 1,
+      after: pageInfo.endCursor,
+    });
+    assertEquals(
+      ((second.data as Record<string, unknown>).eventChanges as Record<
+        string,
+        unknown
+      >).nodes,
+      [{ after: { slug: "three" } }],
+    );
+    const incompatible = await execute(server, query, {
+      eventId: 2,
+      after: pageInfo.endCursor,
+    });
+    assertExists(incompatible.errors);
+
+    const catalogueQuery = `
+      query Catalogue($countryCode: Int, $after: String) {
+        catalogueChanges(countryCode: $countryCode, first: 1, after: $after) {
+          nodes { observation { date } }
+          pageInfo { endCursor }
+        }
+      }
+    `;
+    const global = await execute(server, catalogueQuery);
+    const globalPage = ((global.data as Record<string, unknown>)
+      .catalogueChanges as Record<string, unknown>).pageInfo as Record<
+        string,
+        unknown
+      >;
+    assertExists(globalPage.endCursor);
+    const wrongCountry = await execute(server, catalogueQuery, {
+      countryCode: 97,
+      after: globalPage.endCursor,
+    });
+    assertExists(wrongCountry.errors);
   } finally {
     kv.close();
   }

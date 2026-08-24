@@ -23,6 +23,11 @@ import type {
   EventLookupInput,
   StoredChangeSet,
 } from "./archive.ts";
+import {
+  ChangeReadModel,
+  type ViewCatalogueChangeSummary,
+  type ViewEventChangePosition,
+} from "./change_views.ts";
 import { Semaphore } from "./concurrency.ts";
 import { parseUtcDate } from "./date.ts";
 import { KvArchive } from "./kv_archive.ts";
@@ -44,11 +49,19 @@ const typeDefs = /* GraphQL */ `
     event(slug: String!, asOf: Date!): EventLookup!
     events(inputs: [EventLookupInput!]!): [EventLookup!]!
     catalogueChanges(
+      countryCode: Int = null
       from: Date
       through: Date
       first: Int = 20
       after: String
     ): CatalogueChangeConnection!
+    eventChanges(
+      eventId: Int!
+      from: Date
+      through: Date
+      first: Int = 20
+      after: String
+    ): EventChangeHistoryConnection!
     archiveInfo: ArchiveInfo!
   }
 
@@ -130,6 +143,27 @@ const typeDefs = /* GraphQL */ `
     changedFields: [EventField!]!
   }
 
+  type EventChangeHistoryConnection {
+    nodes: [EventChangeHistory!]!
+    pageInfo: PageInfo!
+  }
+
+  type EventChangeHistory {
+    kind: EventChangeKind!
+    observation: Observation!
+    previousObservation: Observation!
+    before: Event
+    after: Event
+    changedFields: [EventField!]!
+    confirmedAnomaly: Boolean!
+  }
+
+  enum EventChangeKind {
+    APPEARED
+    DISAPPEARED
+    UPDATED
+  }
+
   enum EventField {
     SLUG
     NAME
@@ -170,6 +204,7 @@ const dateTimeScalar = new GraphQLScalarType({
 });
 
 interface CatalogueChangesArguments {
+  readonly countryCode?: number | null;
   readonly from?: string | null;
   readonly through?: string | null;
   readonly first: number;
@@ -181,11 +216,20 @@ interface EventChangesArguments {
   readonly after?: string | null;
 }
 
+interface EventHistoryArguments {
+  readonly eventId: number;
+  readonly from?: string | null;
+  readonly through?: string | null;
+  readonly first: number;
+  readonly after?: string | null;
+}
+
 interface ChangeSetCursor {
-  readonly version: 1;
+  readonly version: 2;
   readonly connection: "catalogue-changes";
   readonly from: string | null;
   readonly through: string | null;
+  readonly countryCode: number | null;
   readonly lastDate: string;
 }
 
@@ -203,26 +247,58 @@ interface EventChangeCursor {
   readonly lastId: number;
 }
 
-export function createGraphqlServer(archive: KvArchive) {
-  const eventChanges = async (
+interface ViewEventChangeCursor {
+  readonly version: 2;
+  readonly connection: "event-changes";
+  readonly changeSetHash: string;
+  readonly kind: ChangeKind;
+  readonly page: number;
+  readonly offset: number;
+  readonly lastId: number;
+}
+
+interface EventHistoryCursor {
+  readonly version: 1;
+  readonly connection: "event-history";
+  readonly eventId: number;
+  readonly from: string | null;
+  readonly through: string | null;
+  readonly lastDate: string;
+}
+
+export function createGraphqlServer(
+  archive: KvArchive,
+  changeViews?: ChangeReadModel,
+) {
+  const resolveEventChanges = async (
     parent: CatalogueChangeSummary,
     arguments_: EventChangesArguments,
     kind: ChangeKind,
     context: GraphqlContext,
   ) => {
     validatePageSize(arguments_.first);
-    const afterId = arguments_.after === undefined || arguments_.after === null
+    const after = arguments_.after === undefined || arguments_.after === null
       ? undefined
       : decodeEventChangeCursor(arguments_.after, parent.hash, kind);
     const pageKey = JSON.stringify([
       parent.hash,
+      isViewSummary(parent) ? parent.viewCountryCode : "canonical",
       kind,
       arguments_.first,
-      afterId ?? null,
+      after ?? null,
     ]);
     let pagePromise = context.eventChangePages.get(pageKey);
     if (pagePromise === undefined) {
       pagePromise = context.archiveSemaphore.run(async () => {
+        if (isViewSummary(parent)) {
+          if (changeViews === undefined) {
+            throw new Error("Materialized change view is unavailable");
+          }
+          return await changeViews.getEventChanges(parent, kind, {
+            first: arguments_.first,
+            ...(after?.position === undefined ? {} : { after: after.position }),
+          });
+        }
         let changeSetPromise = context.changeSets.get(parent.hash);
         if (changeSetPromise === undefined) {
           changeSetPromise = archive.loadChangeSet(parent.hash);
@@ -231,25 +307,36 @@ export function createGraphqlServer(archive: KvArchive) {
         const changeSet = await changeSetPromise;
         return await archive.getEventChanges(parent.hash, kind, {
           first: arguments_.first,
-          ...(afterId === undefined ? {} : { afterId }),
+          ...(after === undefined ? {} : { afterId: after.lastId }),
           changeSet,
         });
       });
       context.eventChangePages.set(pageKey, pagePromise);
     }
     const page = await pagePromise;
+    const viewPosition = "endPosition" in page
+      ? page.endPosition as ViewEventChangePosition | null
+      : null;
     return {
       nodes: page.nodes,
       pageInfo: {
         hasNextPage: page.hasNextPage,
         endCursor: page.endId === null ? null : encodeCursor(
-          {
-            version: 1,
-            connection: "event-changes",
-            changeSetHash: parent.hash,
-            kind,
-            lastId: page.endId,
-          } satisfies EventChangeCursor,
+          viewPosition === null
+            ? {
+              version: 1,
+              connection: "event-changes",
+              changeSetHash: parent.hash,
+              kind,
+              lastId: page.endId,
+            } satisfies EventChangeCursor
+            : {
+              version: 2,
+              connection: "event-changes",
+              changeSetHash: parent.hash,
+              kind,
+              ...viewPosition,
+            } satisfies ViewEventChangeCursor,
         ),
       },
     };
@@ -301,14 +388,82 @@ export function createGraphqlServer(archive: KvArchive) {
           context: GraphqlContext,
         ) => {
           validatePageSize(arguments_.first);
+          const countryCode = arguments_.countryCode ?? null;
           const from = arguments_.from ?? null;
           const through = arguments_.through ?? null;
           const afterDate = arguments_.after === undefined ||
               arguments_.after === null
             ? undefined
-            : decodeChangeSetCursor(arguments_.after, from, through);
+            : decodeChangeSetCursor(
+              arguments_.after,
+              countryCode,
+              from,
+              through,
+            );
           const page = await context.archiveSemaphore.run(() =>
-            archive.listCatalogueChanges({
+            changeViews === undefined
+              ? countryCode === null
+                ? archive.listCatalogueChanges({
+                  first: arguments_.first,
+                  ...(from === null ? {} : { from }),
+                  ...(through === null ? {} : { through }),
+                  ...(afterDate === undefined ? {} : { afterDate }),
+                })
+                : Promise.reject(
+                  new GraphQLError("Country filtering is not available", {
+                    extensions: { code: "CHANGE_VIEW_NOT_READY" },
+                  }),
+                )
+              : changeViews.listCatalogueChanges({
+                first: arguments_.first,
+                ...(countryCode === null ? {} : { countryCode }),
+                ...(from === null ? {} : { from }),
+                ...(through === null ? {} : { through }),
+                ...(afterDate === undefined ? {} : { afterDate }),
+              })
+          );
+          return {
+            nodes: page.nodes,
+            pageInfo: {
+              hasNextPage: page.hasNextPage,
+              endCursor: page.endDate === null ? null : encodeCursor(
+                {
+                  version: 2,
+                  connection: "catalogue-changes",
+                  countryCode,
+                  from,
+                  through,
+                  lastDate: page.endDate,
+                } satisfies ChangeSetCursor,
+              ),
+            },
+          };
+        },
+        eventChanges: async (
+          _parent: unknown,
+          arguments_: EventHistoryArguments,
+          context: GraphqlContext,
+        ) => {
+          validatePageSize(arguments_.first);
+          if (changeViews === undefined) {
+            throw new GraphQLError("Event history is not available", {
+              extensions: { code: "CHANGE_VIEW_NOT_READY" },
+            });
+          }
+          const from = arguments_.from ?? null;
+          const through = arguments_.through ?? null;
+          const afterDate = arguments_.after === undefined ||
+              arguments_.after === null
+            ? undefined
+            : decodeEventHistoryCursor(
+              arguments_.after,
+              arguments_.eventId,
+              from,
+              through,
+            );
+          const page = await context.archiveSemaphore.run(() =>
+            changeViews.listEventChanges({
+              eventId: arguments_.eventId,
               first: arguments_.first,
               ...(from === null ? {} : { from }),
               ...(through === null ? {} : { through }),
@@ -322,11 +477,12 @@ export function createGraphqlServer(archive: KvArchive) {
               endCursor: page.endDate === null ? null : encodeCursor(
                 {
                   version: 1,
-                  connection: "catalogue-changes",
+                  connection: "event-history",
+                  eventId: arguments_.eventId,
                   from,
                   through,
                   lastDate: page.endDate,
-                } satisfies ChangeSetCursor,
+                } satisfies EventHistoryCursor,
               ),
             },
           };
@@ -342,17 +498,22 @@ export function createGraphqlServer(archive: KvArchive) {
           parent: CatalogueChangeSummary,
           arguments_: EventChangesArguments,
           context: GraphqlContext,
-        ) => eventChanges(parent, arguments_, "appeared", context),
+        ) => resolveEventChanges(parent, arguments_, "appeared", context),
         disappeared: (
           parent: CatalogueChangeSummary,
           arguments_: EventChangesArguments,
           context: GraphqlContext,
-        ) => eventChanges(parent, arguments_, "disappeared", context),
+        ) => resolveEventChanges(parent, arguments_, "disappeared", context),
         updated: (
           parent: CatalogueChangeSummary,
           arguments_: EventChangesArguments,
           context: GraphqlContext,
-        ) => eventChanges(parent, arguments_, "updated", context),
+        ) => resolveEventChanges(parent, arguments_, "updated", context),
+      },
+      EventChangeKind: {
+        APPEARED: "appeared",
+        DISAPPEARED: "disappeared",
+        UPDATED: "updated",
       },
       Event: {
         url: (event: { readonly countryUrl: string; readonly slug: string }) =>
@@ -597,7 +758,13 @@ function validatePageSize(first: number): void {
   }
 }
 
-function encodeCursor(value: ChangeSetCursor | EventChangeCursor): string {
+function encodeCursor(
+  value:
+    | ChangeSetCursor
+    | EventChangeCursor
+    | ViewEventChangeCursor
+    | EventHistoryCursor,
+): string {
   return btoa(JSON.stringify(value))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
@@ -606,14 +773,18 @@ function encodeCursor(value: ChangeSetCursor | EventChangeCursor): string {
 
 function decodeChangeSetCursor(
   cursor: string,
+  countryCode: number | null,
   from: string | null,
   through: string | null,
 ): string {
   const value = decodeCursor(cursor);
+  const compatibleV1 = value.version === 1 && countryCode === null;
+  const compatibleV2 = value.version === 2 &&
+    value.countryCode === countryCode;
   if (
-    value.version !== 1 || value.connection !== "catalogue-changes" ||
-    value.from !== from || value.through !== through ||
-    typeof value.lastDate !== "string"
+    value.connection !== "catalogue-changes" ||
+    (!compatibleV1 && !compatibleV2) || value.from !== from ||
+    value.through !== through || typeof value.lastDate !== "string"
   ) {
     throw invalidCursor();
   }
@@ -628,16 +799,58 @@ function decodeEventChangeCursor(
   cursor: string,
   changeSetHash: string,
   kind: ChangeKind,
-): number {
+): { readonly lastId: number; readonly position?: ViewEventChangePosition } {
   const value = decodeCursor(cursor);
   if (
-    value.version !== 1 || value.connection !== "event-changes" ||
+    value.connection !== "event-changes" ||
     value.changeSetHash !== changeSetHash || value.kind !== kind ||
     !Number.isSafeInteger(value.lastId) || (value.lastId as number) < 0
   ) {
     throw invalidCursor();
   }
-  return value.lastId as number;
+  if (value.version === 1) return { lastId: value.lastId as number };
+  if (
+    value.version !== 2 || !Number.isSafeInteger(value.page) ||
+    (value.page as number) < 0 || !Number.isSafeInteger(value.offset) ||
+    (value.offset as number) < 0
+  ) {
+    throw invalidCursor();
+  }
+  return {
+    lastId: value.lastId as number,
+    position: {
+      page: value.page as number,
+      offset: value.offset as number,
+      lastId: value.lastId as number,
+    },
+  };
+}
+
+function decodeEventHistoryCursor(
+  cursor: string,
+  eventId: number,
+  from: string | null,
+  through: string | null,
+): string {
+  const value = decodeCursor(cursor);
+  if (
+    value.version !== 1 || value.connection !== "event-history" ||
+    value.eventId !== eventId || value.from !== from ||
+    value.through !== through || typeof value.lastDate !== "string"
+  ) {
+    throw invalidCursor();
+  }
+  try {
+    return parseUtcDate(value.lastDate);
+  } catch {
+    throw invalidCursor();
+  }
+}
+
+function isViewSummary(
+  value: CatalogueChangeSummary,
+): value is ViewCatalogueChangeSummary {
+  return "viewPageCounts" in value && "viewCountryCode" in value;
 }
 
 function decodeCursor(cursor: string): Record<string, unknown> {

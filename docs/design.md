@@ -131,11 +131,19 @@ type Query {
   event(slug: String!, asOf: Date!): EventLookup!
   events(inputs: [EventLookupInput!]!): [EventLookup!]!
   catalogueChanges(
+    countryCode: Int = null
     from: Date
     through: Date
     first: Int = 20
     after: String
   ): CatalogueChangeConnection!
+  eventChanges(
+    eventId: Int!
+    from: Date
+    through: Date
+    first: Int = 20
+    after: String
+  ): EventChangeHistoryConnection!
   archiveInfo: ArchiveInfo!
 }
 
@@ -214,6 +222,27 @@ type EventChange {
   before: Event
   after: Event
   changedFields: [EventField!]!
+}
+
+type EventChangeHistoryConnection {
+  nodes: [EventChangeHistory!]!
+  pageInfo: PageInfo!
+}
+
+type EventChangeHistory {
+  kind: EventChangeKind!
+  observation: Observation!
+  previousObservation: Observation!
+  before: Event
+  after: Event
+  changedFields: [EventField!]!
+  confirmedAnomaly: Boolean!
+}
+
+enum EventChangeKind {
+  APPEARED
+  DISAPPEARED
+  UPDATED
 }
 
 enum EventField {
@@ -368,6 +397,49 @@ duplicated event objects. Pages are sized by encoded bytes and never exceed the
 48 KiB safety ceiling.
 
 No key in accepted history has a TTL.
+
+### Materialized change views
+
+Canonical change sets remain the source of truth. Query-specific records under
+`["parkrun-events", "read-v2", ...]` duplicate complete before and after event
+values so public queries do not fan out across normalized records.
+
+```text
+["read-v2", "catalogue", "all", date] -> global summary
+["read-v2", "catalogue", "country", countryCode, date] -> filtered summary
+["read-v2", "detail", "all", changeSetHash, kind, page] -> global changes
+["read-v2", "detail", "country", countryCode, changeSetHash, kind, page]
+["read-v2", "event", eventId, date] -> one complete event transition
+["read-v2", "meta", "watermark"] -> latest fully projected date
+```
+
+Stored event and change values use compact versioned tuples. Detail pages are
+packed by encoded UTF-8 bytes toward 3,500 bytes. This target stays below Deno
+KV's 4 KiB read-unit boundary with serialization margin. If one pathological
+change exceeds the target it occupies a page alone; every value still has a hard
+48 KiB ceiling. Confirmed mass changes therefore create more bounded pages
+instead of oversized values.
+
+Country membership uses the after-country for appearances, the before-country
+for disappearances, and the union of both countries for updates. A move is
+visible under both countries without duplication within either. Omitting or
+passing null for `countryCode` selects the global view.
+
+Derived records are staged idempotently before the watermark advances. Readers
+cap date, country, and event results at the watermark, so interruption can leave
+only invisible records. A retry verifies and reuses them. Daily ingestion
+synchronizes the view after canonical publication; no-change observations
+advance only the watermark.
+
+The initial historical projection is built by a temporary validation-first
+backfill command. The reusable projector stays in production, but the one-off
+script and task are removed after production verification.
+
+Against the 42 imported observations, the projection contains 642 records and
+about 260 KiB of encoded values; its largest normal value is about 2.3 KiB. The
+README `RecentChanges` query for the four August change dates uses 16 estimated
+4 KiB read units instead of roughly 200. A regression test fixes the equivalent
+single-date query at five units: watermark, summary, and three detail pages.
 
 ## Ingestion algorithm
 

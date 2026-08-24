@@ -125,7 +125,7 @@ Deno.test("historical loader validates every file before applying", async () => 
     env: (name) =>
       name === "DENO_KV_ACCESS_TOKEN"
         ? "available"
-        : "https://api.deno.com/v2/databases/id/connect",
+        : "https://api.deno.com/v2/databases/019c8f20-c5de-7ad2-9e11-123456789abc/connect",
     readManifest: () => Promise.resolve(manifest),
     readSnapshot: (_path, entry) => {
       order.push(`validate:${entry.date}`);
@@ -270,7 +270,7 @@ Deno.test("historical loader reports trailing pending state explicitly", async (
     env: (name: string) =>
       name === "DENO_KV_ACCESS_TOKEN"
         ? "available"
-        : "https://api.deno.com/v2/databases/id/connect",
+        : "https://api.deno.com/v2/databases/019c8f20-c5de-7ad2-9e11-123456789abc/connect",
     readManifest: () => Promise.resolve(manifest),
     readSnapshot: (_path: string, entry: HistoricalSnapshotManifestEntry) =>
       Promise.resolve(historicalSnapshot(entry)),
@@ -306,9 +306,9 @@ Deno.test("historical loader reports trailing pending state explicitly", async (
 Deno.test("historical loader accepts only Deno production KV connector URLs", () => {
   assertEquals(
     validateProductionDatabaseUrl(
-      "https://api.deno.com/v2/databases/018f-id/connect",
+      "https://api.deno.com/v2/databases/019c8f20-c5de-7ad2-9e11-123456789abc/connect",
     ),
-    "https://api.deno.com/v2/databases/018f-id/connect",
+    "https://api.deno.com/v2/databases/019c8f20-c5de-7ad2-9e11-123456789abc/connect",
   );
   for (
     const value of [
@@ -316,6 +316,7 @@ Deno.test("historical loader accepts only Deno production KV connector URLs", ()
       "https://example.com/v2/databases/id/connect",
       "https://api.deno.com/v2/databases/id/connect?token=secret",
       "https://api.deno.com/v2/databases/id/other",
+      "https://api.deno.com/v2/databases/035bec-production/connect",
     ]
   ) {
     assertThrows(

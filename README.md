@@ -99,11 +99,14 @@ Variables:
 ## See what changed
 
 `catalogueChanges` returns observed transitions in chronological order. It does
-not hide an event that disappeared and later reappeared.
+not hide an event that disappeared and later reappeared. Pass `countryCode` to
+return only changes involving that country; omit it or pass `null` for all
+countries. A move between countries appears under both.
 
 ```graphql
-query RecentChanges($after: String) {
+query RecentChanges($after: String, $countryCode: Int) {
   catalogueChanges(
+    countryCode: $countryCode
     from: "2026-08-01"
     through: "2026-08-31"
     first: 20
@@ -171,6 +174,28 @@ change set is large.
 
 `confirmedAnomaly` is true when an unusually large catalogue change was held
 back until a later observation confirmed it.
+
+## Follow one event
+
+Numeric event IDs remain stable when slugs change. Use `eventChanges` to read
+one event's complete chronological history without scanning every catalogue
+change:
+
+```graphql
+query EventHistory($eventId: Int!, $after: String) {
+  eventChanges(eventId: $eventId, first: 20, after: $after) {
+    nodes {
+      kind
+      observation { date }
+      previousObservation { date }
+      changedFields
+      before { slug name countryCode }
+      after { slug name countryCode }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
 
 ## Date behavior
 

@@ -1,3 +1,4 @@
+import type { ChangeReadModel } from "./change_views.ts";
 import { KvArchive } from "./kv_archive.ts";
 import { createGraphqlServer } from "./graphql.ts";
 
@@ -5,6 +6,7 @@ const DEFAULT_MAXIMUM_REQUEST_BYTES = 64 * 1024;
 
 export interface AppOptions {
   readonly maximumRequestBytes?: number;
+  readonly changeViews?: ChangeReadModel;
 }
 
 export type HttpHandler = (request: Request) => Promise<Response>;
@@ -13,7 +15,7 @@ export function createApp(
   archive: KvArchive,
   options: AppOptions = {},
 ): HttpHandler {
-  const graphql = createGraphqlServer(archive);
+  const graphql = createGraphqlServer(archive, options.changeViews);
   const maximumRequestBytes = options.maximumRequestBytes ??
     DEFAULT_MAXIMUM_REQUEST_BYTES;
 
