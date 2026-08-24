@@ -2,6 +2,7 @@ import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import {
   HistoricalSnapshotError,
   parseHistoricalSnapshotManifest,
+  readBoundedFile,
   readHistoricalSnapshot,
   readHistoricalSnapshotManifest,
 } from "../src/history_manifest.ts";
@@ -54,6 +55,26 @@ Deno.test("snapshot manifests require strictly chronological observations", () =
   );
 });
 
+Deno.test("snapshot manifests require canonical UTC fetch timestamps", () => {
+  for (
+    const fetchedAt of [
+      "2026-08-01",
+      "2026-08-01T04:00:00+01:00",
+      "2026-08-01T03:00:00Z",
+    ]
+  ) {
+    assertThrows(
+      () =>
+        parseHistoricalSnapshotManifest(manifest([{
+          ...manifestEntry("2026-08-01"),
+          fetchedAt,
+        }])),
+      HistoricalSnapshotError,
+      "fetchedAt",
+    );
+  }
+});
+
 Deno.test("snapshot manifests reject unsafe file paths and unknown fields", () => {
   assertThrows(
     () =>
@@ -73,6 +94,31 @@ Deno.test("snapshot manifests reject unsafe file paths and unknown fields", () =
     HistoricalSnapshotError,
     "unknown field",
   );
+});
+
+Deno.test("snapshot readers stop at their byte limit", async () => {
+  let closed = false;
+  const source = new Uint8Array([1, 2, 3, 4, 5]);
+  let offset = 0;
+  await assertRejects(
+    () =>
+      readBoundedFile("large.json", 4, () =>
+        Promise.resolve({
+          read(buffer: Uint8Array) {
+            const count = Math.min(buffer.byteLength, source.length - offset);
+            if (count === 0) return Promise.resolve(null);
+            buffer.set(source.subarray(offset, offset + count));
+            offset += count;
+            return Promise.resolve(count);
+          },
+          close() {
+            closed = true;
+          },
+        })),
+    HistoricalSnapshotError,
+    "exceeds",
+  );
+  assertEquals(closed, true);
 });
 
 Deno.test("snapshot manifests bound input size", async () => {

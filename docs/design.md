@@ -523,10 +523,13 @@ manifest has this shape:
 }
 ```
 
-Dates must be strictly increasing, timestamps must fall on their UTC observation
-date, paths must remain under the manifest directory, and every file must match
-its declared SHA-256 digest. Each file goes through the same size, schema, ID,
-slug, coordinate, country, and event-count validation as the live source.
+Dates must be strictly increasing, timestamps must use canonical UTC
+`YYYY-MM-DDTHH:mm:ss.sssZ` form and fall on their observation date, paths must
+remain under the manifest directory, and every file must match its declared
+SHA-256 digest. The manifest directory must be private to the operator and must
+not be modified while validation or loading is running. Each file goes through
+the same size, schema, ID, slug, coordinate, country, and event-count validation
+as the live source.
 
 `deno task history:load --manifest <path>` is validation-only. It checks every
 file and prints its source digest, revision hash, and event count without
@@ -540,8 +543,10 @@ when its revision, count, timestamp, and ETag exactly match. The loader refuses
 to insert a missing observation before the current head, so importing older
 history requires an empty database or a new database that can replace the old
 one after verification. Large changes use the same pending-confirmation policy
-as live ingestion; a trailing unconfirmed anomaly fails the command unless the
-operator explicitly allows it.
+as live ingestion. A trailing unconfirmed anomaly remains safely quarantined and
+makes the command exit nonzero. Add a later confirming snapshot and rerun;
+`--accept-pending` changes that final state to a successful exit without
+publishing it.
 
 Disable production ingestion while loading to prevent the daily cron from
 advancing the head past an imported date. Re-enable it only after archive

@@ -1,5 +1,8 @@
 import { parseUtcDate, utcDateOf } from "./date.ts";
 import {
+  type HistoricalSnapshot,
+  type HistoricalSnapshotManifest,
+  type HistoricalSnapshotManifestEntry,
   readHistoricalSnapshot,
   readHistoricalSnapshotManifest,
 } from "./history_manifest.ts";
@@ -15,7 +18,7 @@ export interface HistoricalLoaderArguments {
   readonly manifestPath: string | null;
   readonly databaseUrl: string | null;
   readonly apply: boolean;
-  readonly allowPending: boolean;
+  readonly acceptPending: boolean;
   readonly help: boolean;
 }
 
@@ -23,6 +26,21 @@ export interface HistoricalLoaderRunOptions {
   readonly today?: string;
   readonly env?: (name: string) => string | undefined;
   readonly writeLine?: (line: string) => void;
+  readonly readManifest?: (
+    path: string,
+  ) => Promise<HistoricalSnapshotManifest>;
+  readonly readSnapshot?: (
+    manifestPath: string,
+    entry: HistoricalSnapshotManifestEntry,
+  ) => Promise<HistoricalSnapshot>;
+  readonly applySnapshots?: (
+    databaseUrl: string,
+    entries: readonly HistoricalSnapshotManifestEntry[],
+    readSnapshot: (
+      entry: HistoricalSnapshotManifestEntry,
+    ) => Promise<HistoricalSnapshot>,
+    today: string,
+  ) => Promise<HistoricalSnapshotLoadReport>;
 }
 
 export function parseHistoricalLoaderArgs(
@@ -31,7 +49,7 @@ export function parseHistoricalLoaderArgs(
   let manifestPath: string | null = null;
   let databaseUrl: string | null = null;
   let apply = false;
-  let allowPending = false;
+  let acceptPending = false;
   let help = false;
 
   for (let index = 0; index < args.length; index += 1) {
@@ -41,11 +59,11 @@ export function parseHistoricalLoaderArgs(
     } else if (argument === "--apply") {
       if (apply) throw new TypeError("Duplicate --apply argument");
       apply = true;
-    } else if (argument === "--allow-pending") {
-      if (allowPending) {
-        throw new TypeError("Duplicate --allow-pending argument");
+    } else if (argument === "--accept-pending") {
+      if (acceptPending) {
+        throw new TypeError("Duplicate --accept-pending argument");
       }
-      allowPending = true;
+      acceptPending = true;
     } else if (argument === "--manifest") {
       manifestPath = uniqueOptionValue(
         "--manifest",
@@ -78,10 +96,10 @@ export function parseHistoricalLoaderArgs(
   if (!help && manifestPath === null) {
     throw new TypeError("--manifest is required");
   }
-  if (allowPending && !apply) {
-    throw new TypeError("--allow-pending requires --apply");
+  if (acceptPending && !apply) {
+    throw new TypeError("--accept-pending requires --apply");
   }
-  return { manifestPath, databaseUrl, apply, allowPending, help };
+  return { manifestPath, databaseUrl, apply, acceptPending, help };
 }
 
 export function validateProductionDatabaseUrl(value: string): string {
@@ -113,7 +131,9 @@ export async function runHistoricalLoader(
   const manifestPath = arguments_.manifestPath!;
   const writeLine = options.writeLine ?? console.log;
   const today = parseUtcDate(options.today ?? utcDateOf(new Date()));
-  const manifest = await readHistoricalSnapshotManifest(manifestPath);
+  const readManifest = options.readManifest ?? readHistoricalSnapshotManifest;
+  const readSnapshot = options.readSnapshot ?? readHistoricalSnapshot;
+  const manifest = await readManifest(manifestPath);
 
   for (const entry of manifest.snapshots) {
     if (entry.date > today) {
@@ -121,7 +141,7 @@ export async function runHistoricalLoader(
         `Historical snapshot ${entry.date} is in the future`,
       );
     }
-    const snapshot = await readHistoricalSnapshot(manifestPath, entry);
+    const snapshot = await readSnapshot(manifestPath, entry);
     const revision = await buildRevision(snapshot.events);
     writeLine(JSON.stringify({
       event: "snapshot_validated",
@@ -149,32 +169,47 @@ export async function runHistoricalLoader(
   const databaseUrl = validateProductionDatabaseUrl(
     arguments_.databaseUrl ?? env("DENO_KV_URL") ?? "",
   );
-  const kv = await Deno.openKv(databaseUrl);
+  const applySnapshots = options.applySnapshots ??
+    applyHistoricalSnapshotsToDatabase;
+  const report = await applySnapshots(
+    databaseUrl,
+    manifest.snapshots,
+    (entry) => readSnapshot(manifestPath, entry),
+    today,
+  );
+  for (const row of report.rows) {
+    writeLine(JSON.stringify({
+      event: "snapshot_load_finished",
+      sourceSha256: row.sourceSha256,
+      ...row.outcome,
+    }));
+  }
+  if (report.pendingDate !== null && !arguments_.acceptPending) {
+    throw new HistoricalSnapshotConflictError(
+      `Snapshot ${report.pendingDate} remains safely quarantined; add a later confirming snapshot and rerun, or use --accept-pending to treat this state as successful`,
+    );
+  }
+  writeLine(JSON.stringify({
+    event: "historical_load_finished",
+    snapshotCount: report.rows.length,
+    pendingDate: report.pendingDate,
+  }));
+  return report;
+}
+
+export async function applyHistoricalSnapshotsToDatabase(
+  databaseUrl: string,
+  entries: readonly HistoricalSnapshotManifestEntry[],
+  readSnapshot: (
+    entry: HistoricalSnapshotManifestEntry,
+  ) => Promise<HistoricalSnapshot>,
+  today: string,
+  openKv: (url: string) => Promise<Deno.Kv> = Deno.openKv,
+): Promise<HistoricalSnapshotLoadReport> {
+  const kv = await openKv(databaseUrl);
   try {
     const loader = new HistoricalSnapshotLoader(new KvArchive(kv));
-    const report = await loader.load(
-      manifest.snapshots,
-      (entry) => readHistoricalSnapshot(manifestPath, entry),
-      { today },
-    );
-    for (const row of report.rows) {
-      writeLine(JSON.stringify({
-        event: "snapshot_load_finished",
-        sourceSha256: row.sourceSha256,
-        ...row.outcome,
-      }));
-    }
-    if (report.pendingDate !== null && !arguments_.allowPending) {
-      throw new HistoricalSnapshotConflictError(
-        `Snapshot ${report.pendingDate} still requires a later confirming snapshot`,
-      );
-    }
-    writeLine(JSON.stringify({
-      event: "historical_load_finished",
-      snapshotCount: report.rows.length,
-      pendingDate: report.pendingDate,
-    }));
-    return report;
+    return await loader.load(entries, readSnapshot, { today });
   } finally {
     kv.close();
   }
@@ -194,9 +229,10 @@ Options:
   --manifest <path>       JSON manifest and snapshot base directory
   --database-url <url>    Production Deno KV connector URL; alternatively DENO_KV_URL
   --apply                 Write snapshots after validating every file
-  --allow-pending         Permit the last anomaly to remain unpublished
+  --accept-pending        Treat a trailing quarantined anomaly as successful
   -h, --help              Show this help
 
+The manifest directory must be private and remain unchanged during the run.
 Tokens are accepted only through DENO_KV_ACCESS_TOKEN, never command arguments.`;
 }
 

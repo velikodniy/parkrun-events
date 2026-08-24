@@ -153,23 +153,32 @@ Deno.test("historical loader applies anomaly confirmation to snapshots", async (
     ];
     const byDate = new Map(snapshots.map((value) => [value.date, value]));
 
-    const report = await loader.load(
-      snapshots.map((value) => entry(value.date)),
+    const firstRun = await loader.load(
+      snapshots.slice(0, 2).map((value) => entry(value.date)),
       (metadata) => Promise.resolve(byDate.get(metadata.date)!),
       { today: "2026-08-04" },
     );
-
-    assertEquals(report.rows.map((row) => row.outcome.status), [
+    assertEquals(firstRun.rows.map((row) => row.outcome.status), [
       "ACCEPTED",
+      "PENDING_CONFIRMATION",
+    ]);
+    assertEquals(firstRun.pendingDate, "2026-08-02");
+
+    const resumed = await loader.load(
+      snapshots.slice(1).map((value) => entry(value.date)),
+      (metadata) => Promise.resolve(byDate.get(metadata.date)!),
+      { today: "2026-08-04" },
+    );
+    assertEquals(resumed.rows.map((row) => row.outcome.status), [
       "PENDING_CONFIRMATION",
       "ACCEPTED",
     ]);
     assertEquals(
-      report.rows[2]?.outcome.status === "ACCEPTED" &&
-        report.rows[2].outcome.confirmedAnomaly,
+      resumed.rows[1]?.outcome.status === "ACCEPTED" &&
+        resumed.rows[1].outcome.confirmedAnomaly,
       true,
     );
-    assertEquals(report.pendingDate, null);
+    assertEquals(resumed.pendingDate, null);
   } finally {
     kv.close();
   }

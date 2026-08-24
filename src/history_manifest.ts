@@ -11,9 +11,12 @@ import {
 } from "./source.ts";
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const CANONICAL_UTC_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const SAFE_RELATIVE_FILE_PATTERN = /^[a-zA-Z0-9._/-]+$/u;
 const MAX_MANIFEST_SNAPSHOTS = 5_000;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_BOUNDED_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_ETAG_BYTES = 1_024;
 
 export interface HistoricalSnapshotManifestEntry {
@@ -33,6 +36,11 @@ export interface HistoricalSnapshotManifest {
 export interface HistoricalSnapshot extends HistoricalSnapshotManifestEntry {
   readonly sourceSha256: string;
   readonly events: readonly EventRecord[];
+}
+
+export interface ReadableSnapshotFile {
+  readonly read: (buffer: Uint8Array) => Promise<number | null>;
+  readonly close: () => void;
 }
 
 export interface ReadHistoricalSnapshotOptions {
@@ -98,16 +106,28 @@ export async function readHistoricalSnapshot(
   entry: HistoricalSnapshotManifestEntry,
   options: ReadHistoricalSnapshotOptions = {},
 ): Promise<HistoricalSnapshot> {
+  const realPath = options.realPath ?? Deno.realPath;
   const filePath = await resolveSnapshotPath(
     manifestPath,
     entry.file,
-    options.realPath ?? Deno.realPath,
+    realPath,
   );
-  const bytes = await (options.readFile ?? Deno.readFile)(filePath);
   const maximumBytes = options.maximumBytes ?? DEFAULT_MAX_SOURCE_BYTES;
+  const bytes = await (options.readFile ??
+    ((path) => readBoundedFile(path, maximumBytes)))(filePath);
   if (bytes.byteLength > maximumBytes) {
     throw new HistoricalSnapshotError(
       `Snapshot ${entry.file} exceeds ${maximumBytes} bytes`,
+    );
+  }
+  const confirmedPath = await resolveSnapshotPath(
+    manifestPath,
+    entry.file,
+    realPath,
+  );
+  if (confirmedPath !== filePath) {
+    throw new HistoricalSnapshotError(
+      `Snapshot ${entry.file} changed paths while it was read`,
     );
   }
   const sourceSha256 = await sha256Hex(bytes);
@@ -132,7 +152,7 @@ export async function readHistoricalSnapshot(
 
 export async function readHistoricalSnapshotManifest(
   manifestPath: string,
-  readTextFile: (path: string) => Promise<string> = Deno.readTextFile,
+  readTextFile: (path: string) => Promise<string> = readBoundedManifestText,
 ): Promise<HistoricalSnapshotManifest> {
   let text: string;
   try {
@@ -150,6 +170,49 @@ export async function readHistoricalSnapshotManifest(
   } catch (error) {
     if (error instanceof HistoricalSnapshotError) throw error;
     throw new HistoricalSnapshotError("Snapshot manifest is not valid JSON");
+  }
+}
+
+export async function readBoundedFile(
+  path: string,
+  maximumBytes: number,
+  openFile: (path: string) => Promise<ReadableSnapshotFile> = (path) =>
+    Deno.open(path, { read: true }),
+): Promise<Uint8Array> {
+  if (
+    !Number.isSafeInteger(maximumBytes) || maximumBytes < 1 ||
+    maximumBytes > MAX_BOUNDED_FILE_BYTES
+  ) {
+    throw new RangeError(
+      `Maximum file size must be between 1 and ${MAX_BOUNDED_FILE_BYTES} bytes`,
+    );
+  }
+  const file = await openFile(path);
+  try {
+    const buffer = new Uint8Array(maximumBytes + 1);
+    let offset = 0;
+    while (offset < buffer.byteLength) {
+      const count = await file.read(buffer.subarray(offset));
+      if (count === null || count === 0) break;
+      offset += count;
+    }
+    if (offset > maximumBytes) {
+      throw new HistoricalSnapshotError(
+        `File ${path} exceeds ${maximumBytes} bytes`,
+      );
+    }
+    return buffer.slice(0, offset);
+  } finally {
+    file.close();
+  }
+}
+
+async function readBoundedManifestText(path: string): Promise<string> {
+  const bytes = await readBoundedFile(path, MAX_MANIFEST_BYTES);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new HistoricalSnapshotError("Snapshot manifest is not valid UTF-8");
   }
 }
 
@@ -177,10 +240,14 @@ function parseManifestEntry(
     throw new HistoricalSnapshotError(`${label} fetchedAt must be a string`);
   }
   const fetched = new Date(record.fetchedAt);
-  if (Number.isNaN(fetched.getTime())) {
+  if (
+    !CANONICAL_UTC_TIMESTAMP_PATTERN.test(record.fetchedAt) ||
+    Number.isNaN(fetched.getTime()) ||
+    fetched.toISOString() !== record.fetchedAt
+  ) {
     throw new HistoricalSnapshotError(`${label} fetchedAt is invalid`);
   }
-  const fetchedAt = fetched.toISOString();
+  const fetchedAt = record.fetchedAt;
   if (fetchedAt.slice(0, 10) !== date) {
     throw new HistoricalSnapshotError(
       `${label} fetchedAt must fall on its UTC observation date`,
