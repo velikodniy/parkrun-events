@@ -94,10 +94,16 @@ export class IngestionService {
       );
       const diff = diffRevisions(previous, candidate);
       const pending = control.pending.value;
+      if (pending !== null && pending.baseRevisionHash !== previous.hash) {
+        throw new Error(
+          "Pending anomaly baseline does not match the archive head",
+        );
+      }
       if (pending !== null && await this.confirms(pending, candidate)) {
         if (
           await this.publish(
             control,
+            date,
             fetched,
             previous,
             candidate,
@@ -137,6 +143,7 @@ export class IngestionService {
       if (
         await this.publish(
           control,
+          date,
           fetched,
           previous,
           candidate,
@@ -158,6 +165,13 @@ export class IngestionService {
     const pendingChangeSet = await this.archive.loadChangeSet(
       pending.changeSetHash,
     );
+    if (
+      pendingChangeSet.manifest.previousRevisionHash !==
+        pending.baseRevisionHash ||
+      pendingChangeSet.manifest.revisionHash !== pending.candidateRevisionHash
+    ) {
+      throw new Error("Pending anomaly does not match its stored change set");
+    }
     return confirmsPendingChanges(
       pendingChangeSet.diff,
       candidate.eventsById,
@@ -166,6 +180,7 @@ export class IngestionService {
 
   private async publish(
     control: ArchiveControl,
+    date: string,
     fetched: FetchedCatalogue,
     previous: CatalogueRevision,
     candidate: CatalogueRevision,
@@ -176,7 +191,7 @@ export class IngestionService {
       ? null
       : await this.archive.stageChangeSet(previous.hash, candidate.hash, diff);
     const input: PublishObservationInput = {
-      date: control.observation.key.at(-1) as string,
+      date,
       fetchedAt: fetched.fetchedAt,
       revisionHash: candidate.hash,
       eventCount: candidate.manifest.eventCount,
