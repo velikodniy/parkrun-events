@@ -34,6 +34,11 @@ export type IngestionOutcome =
     readonly status: "ALREADY_ACCEPTED";
     readonly date: string;
     readonly eventCount: number;
+  }
+  | {
+    readonly status: "SKIPPED_OUT_OF_ORDER";
+    readonly date: string;
+    readonly latestDate: string;
   };
 
 export class IngestionService {
@@ -55,6 +60,10 @@ export class IngestionService {
     if (initialControl.pending.value?.firstSeenDate === date) {
       return await this.pendingOutcome(initialControl.pending.value);
     }
+    const initialLaterDate = latestControlDateAtOrAfter(initialControl, date);
+    if (initialLaterDate !== null) {
+      return outOfOrderOutcome(date, initialLaterDate);
+    }
 
     const fetched = await this.fetchCatalogue();
     const candidate = await buildRevision(fetched.events);
@@ -71,6 +80,10 @@ export class IngestionService {
       }
       if (control.pending.value?.firstSeenDate === date) {
         return await this.pendingOutcome(control.pending.value);
+      }
+      const laterDate = latestControlDateAtOrAfter(control, date);
+      if (laterDate !== null) {
+        return outOfOrderOutcome(date, laterDate);
       }
 
       if (control.head.value === null) {
@@ -227,6 +240,30 @@ function acceptedOutcome(
     eventCount: revision.manifest.eventCount,
     changeCount: changedEventCount(diff),
     confirmedAnomaly,
+  };
+}
+
+function latestControlDateAtOrAfter(
+  control: ArchiveControl,
+  date: string,
+): string | null {
+  const latestDate = [
+    control.head.value?.date,
+    control.pending.value?.firstSeenDate,
+  ].filter((value): value is string => value !== undefined)
+    .sort()
+    .at(-1);
+  return latestDate !== undefined && date <= latestDate ? latestDate : null;
+}
+
+function outOfOrderOutcome(
+  date: string,
+  latestDate: string,
+): IngestionOutcome {
+  return {
+    status: "SKIPPED_OUT_OF_ORDER",
+    date,
+    latestDate,
   };
 }
 

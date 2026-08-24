@@ -4,8 +4,10 @@ export const EVENTS_SOURCE_URL = "https://images.parkrun.com/events.json";
 export const DEFAULT_MINIMUM_EVENT_COUNT = 1_000;
 export const DEFAULT_MAX_SOURCE_BYTES = 5 * 1024 * 1024;
 export const DEFAULT_SOURCE_TIMEOUT_MS = 20_000;
+export const MAX_EVENT_COUNT = 100_000;
 
 const GRAPHQL_INT_MAX = 2_147_483_647;
+const MAX_ETAG_BYTES = 1_024;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const HOST_PATTERN = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 const MAX_SOURCE_STRING_LENGTH = 256;
@@ -18,6 +20,7 @@ type SourceErrorCode =
   | "DUPLICATE_EVENT_ID"
   | "DUPLICATE_EVENT_SLUG"
   | "TOO_FEW_EVENTS"
+  | "TOO_MANY_EVENTS"
   | "SOURCE_TOO_LARGE"
   | "INVALID_JSON"
   | "INVALID_CONTENT_TYPE"
@@ -81,6 +84,13 @@ export function parseEventsDocument(
     "INVALID_SOURCE_DOCUMENT",
   );
   const minimum = options.minimumEventCount ?? DEFAULT_MINIMUM_EVENT_COUNT;
+  if (features.length > MAX_EVENT_COUNT) {
+    throw dataError(
+      "TOO_MANY_EVENTS",
+      "$.events.features",
+      `Expected at most ${MAX_EVENT_COUNT} events, received ${features.length}`,
+    );
+  }
   if (features.length < minimum) {
     throw dataError(
       "TOO_FEW_EVENTS",
@@ -204,7 +214,7 @@ export async function fetchEventsCatalogue(
   return {
     events: parseEventsDocument(document, options),
     fetchedAt: new Date().toISOString(),
-    etag: response.headers.get("etag"),
+    etag: boundedEtag(response.headers.get("etag")),
   };
 }
 
@@ -214,7 +224,7 @@ function parseCountries(
   const countries = new Map<number, string | null>();
   for (const [rawCode, rawCountry] of Object.entries(input)) {
     const code = Number(rawCode);
-    if (!Number.isSafeInteger(code) || code < 0) {
+    if (!Number.isSafeInteger(code) || code < 0 || code > GRAPHQL_INT_MAX) {
       throw dataError(
         "INVALID_COUNTRY",
         `$.countries.${rawCode}`,
@@ -235,7 +245,7 @@ function parseCountries(
       `$.countries.${rawCode}.url`,
       "INVALID_COUNTRY",
     ).toLowerCase();
-    if (!HOST_PATTERN.test(host) || host.includes("..")) {
+    if (!isValidHostname(host)) {
       throw dataError(
         "INVALID_COUNTRY",
         `$.countries.${rawCode}.url`,
@@ -257,14 +267,13 @@ function parseFeature(
   if (feature.type !== "Feature") {
     throw dataError("INVALID_EVENT", `${path}.type`, "Expected Feature");
   }
-  const id = expectInteger(feature.id, `${path}.id`, "INVALID_EVENT", 1);
-  if (id > GRAPHQL_INT_MAX) {
-    throw dataError(
-      "INVALID_EVENT",
-      `${path}.id`,
-      `Event ID exceeds GraphQL Int range: ${id}`,
-    );
-  }
+  const id = expectInteger(
+    feature.id,
+    `${path}.id`,
+    "INVALID_EVENT",
+    1,
+    GRAPHQL_INT_MAX,
+  );
   const properties = expectRecord(
     feature.properties,
     `${path}.properties`,
@@ -287,6 +296,7 @@ function parseFeature(
     `${path}.properties.countrycode`,
     "INVALID_EVENT",
     0,
+    GRAPHQL_INT_MAX,
   );
   const countryUrl = countries.get(countryCode);
   if (countryUrl === undefined || countryUrl === null) {
@@ -354,6 +364,7 @@ function parseFeature(
       `${path}.properties.seriesid`,
       "INVALID_EVENT",
       1,
+      GRAPHQL_INT_MAX,
     ),
   };
 }
@@ -411,12 +422,16 @@ function expectInteger(
   path: string,
   code: SourceErrorCode,
   minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
 ): number {
-  if (!Number.isSafeInteger(value) || (value as number) < minimum) {
+  if (
+    !Number.isSafeInteger(value) || (value as number) < minimum ||
+    (value as number) > maximum
+  ) {
     throw dataError(
       code,
       path,
-      `Expected an integer greater than or equal to ${minimum}`,
+      `Expected an integer between ${minimum} and ${maximum}`,
     );
   }
   return value as number;
@@ -428,6 +443,22 @@ function dataError(
   message: string,
 ): SourceDataError {
   return new SourceDataError(code, `${path}: ${message}`, path);
+}
+
+function boundedEtag(value: string | null): string | null {
+  if (value === null) return null;
+  return new TextEncoder().encode(value).byteLength <= MAX_ETAG_BYTES
+    ? value
+    : null;
+}
+
+function isValidHostname(host: string): boolean {
+  if (!HOST_PATTERN.test(host) || host.length > 253) return false;
+  return host.split(".").every((label) =>
+    label.length > 0 && label.length <= 63 &&
+    /^[a-z0-9-]+$/u.test(label) &&
+    !label.startsWith("-") && !label.endsWith("-")
+  );
 }
 
 function normalizeNegativeZero(value: number): number {

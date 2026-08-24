@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects, assertThrows } from "@std/assert";
 import {
+  fetchEventsCatalogue,
   parseEventsDocument,
   readJsonResponse,
   SourceDataError,
@@ -74,6 +75,49 @@ Deno.test("parseEventsDocument rejects duplicate slugs", () => {
   assertEquals(error.code, "DUPLICATE_EVENT_SLUG");
 });
 
+Deno.test("parseEventsDocument rejects integers outside GraphQL range", () => {
+  const oversized = 2_147_483_648;
+  const oversizedSeries = eventsDocument([
+    eventFeature(1, "alpha", { properties: { seriesid: oversized } }),
+  ]);
+  assertEquals(
+    assertThrows(
+      () => parseEventsDocument(oversizedSeries, { minimumEventCount: 1 }),
+      SourceDataError,
+    ).code,
+    "INVALID_EVENT",
+  );
+
+  const oversizedCountry = eventsDocument([
+    eventFeature(1, "alpha", { properties: { countrycode: oversized } }),
+  ]);
+  (oversizedCountry.countries as Record<string, unknown>)[String(oversized)] = {
+    url: "www.example.test",
+  };
+  assertEquals(
+    assertThrows(
+      () => parseEventsDocument(oversizedCountry, { minimumEventCount: 1 }),
+      SourceDataError,
+    ).code,
+    "INVALID_COUNTRY",
+  );
+});
+
+Deno.test("parseEventsDocument rejects invalid country host labels", () => {
+  const document = eventsDocument([eventFeature(1, "alpha")]);
+  (document.countries as Record<string, { url: string }>)["97"] = {
+    url: "invalid-.example",
+  };
+
+  assertEquals(
+    assertThrows(
+      () => parseEventsDocument(document, { minimumEventCount: 1 }),
+      SourceDataError,
+    ).code,
+    "INVALID_COUNTRY",
+  );
+});
+
 Deno.test("parseEventsDocument rejects invalid coordinates", () => {
   const document = eventsDocument([
     eventFeature(1, "alpha", {
@@ -96,6 +140,24 @@ Deno.test("parseEventsDocument rejects a partial bootstrap", () => {
     SourceDataError,
   );
   assertEquals(error.code, "TOO_FEW_EVENTS");
+});
+
+Deno.test("fetchEventsCatalogue discards an oversized ETag", async () => {
+  const document = eventsDocument([eventFeature(1, "alpha")]);
+  const fetched = await fetchEventsCatalogue({
+    minimumEventCount: 1,
+    fetcher: () =>
+      Promise.resolve(
+        new Response(JSON.stringify(document), {
+          headers: {
+            "content-type": "application/json",
+            etag: "x".repeat(2_000),
+          },
+        }),
+      ),
+  });
+
+  assertEquals(fetched.etag, null);
 });
 
 Deno.test("readJsonResponse enforces the decoded body limit", async () => {

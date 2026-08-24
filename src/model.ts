@@ -168,7 +168,7 @@ export async function buildRevision(
 
   const buckets = await Promise.all(
     entriesByBucket.map(async (entries, index) => {
-      entries.sort((left, right) => left.slug.localeCompare(right.slug));
+      entries.sort((left, right) => compareSlugs(left.slug, right.slug));
       return {
         index,
         entries,
@@ -190,6 +190,10 @@ export async function buildRevision(
     buckets,
     eventsById,
   };
+}
+
+export function compareSlugs(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export function diffRevisions(

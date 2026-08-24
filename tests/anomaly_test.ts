@@ -55,6 +55,8 @@ Deno.test("confirmation allows unrelated changes while pending transitions persi
   ]);
 
   assertEquals(confirmsPendingChanges(pending, candidate), true);
+  candidate.set(2, { event: record(2, "two-corrected"), hash: "corrected" });
+  assertEquals(confirmsPendingChanges(pending, candidate), true);
   candidate.set(3, { event: record(3, "three"), hash: "three" });
   assertEquals(confirmsPendingChanges(pending, candidate), false);
 });

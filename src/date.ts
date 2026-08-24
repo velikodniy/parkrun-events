@@ -16,13 +16,6 @@ export function parseUtcDate(value: string): UtcDate {
   return value;
 }
 
-export function nextUtcDate(value: UtcDate): UtcDate {
-  const date = parseUtcDate(value);
-  const instant = new Date(`${date}T00:00:00.000Z`);
-  instant.setUTCDate(instant.getUTCDate() + 1);
-  return instant.toISOString().slice(0, 10);
-}
-
 export function utcDateOf(value: Date): UtcDate {
   if (Number.isNaN(value.getTime())) throw new TypeError("Invalid Date object");
   return value.toISOString().slice(0, 10);

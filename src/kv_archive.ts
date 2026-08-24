@@ -15,18 +15,21 @@ import type {
   PublishObservationInput,
   StoredChangeSet,
 } from "./archive.ts";
-import { nextUtcDate, parseUtcDate } from "./date.ts";
+import { mapWithConcurrency } from "./concurrency.ts";
+import { parseUtcDate } from "./date.ts";
 import {
   bucketIndexForSlug,
   canonicalBucketJson,
   canonicalEventJson,
   canonicalRevisionJson,
+  compareSlugs,
   sha256Hex,
 } from "./model.ts";
 import type {
   BucketEntry,
   CatalogueDiff,
   CatalogueRevision,
+  EventField,
   EventRecord,
   HashedEvent,
   RevisionBucket,
@@ -44,10 +47,13 @@ const CHANGE_PAGE_PREFIX = [...PREFIX, "change-page"] as const;
 const HEAD_KEY = [...PREFIX, "meta", "head"] as const;
 const PENDING_KEY = [...PREFIX, "meta", "pending"] as const;
 const MAX_BATCH_KEYS = 10;
+const MAX_READ_CONCURRENCY = 8;
 const MAX_ATOMIC_CHECKS = 100;
 const MAX_SAFE_VALUE_BYTES = 48 * 1024;
 const MAX_ATOMIC_STAGE_BYTES = 500 * 1024;
 const CHANGE_PAGE_ITEMS = 50;
+const MAX_ARCHIVE_EVENT_COUNT = 100_000;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 interface ImmutableItem<T> {
   readonly key: Deno.KvKey;
@@ -78,7 +84,7 @@ export class KvArchive {
       .map(({ event, hash }) => ({
         key: eventKey(hash),
         value: event,
-        encoded: canonicalEventJson(event),
+        encoded: JSON.stringify(event),
       }));
     await this.putImmutableItems(eventItems);
 
@@ -87,14 +93,14 @@ export class KvArchive {
       .map((bucket) => ({
         key: bucketKey(bucket.hash),
         value: bucket.entries,
-        encoded: canonicalBucketJson(bucket.entries),
+        encoded: JSON.stringify(bucket.entries),
       }));
     await this.putImmutableItems(bucketItems);
 
     await this.putImmutableItems([{
       key: revisionKey(revision.hash),
       value: revision.manifest,
-      encoded: canonicalRevisionJson(revision.manifest),
+      encoded: JSON.stringify(revision.manifest),
     }]);
   }
 
@@ -156,14 +162,14 @@ export class KvArchive {
   }
 
   async loadChangeSet(hash: string): Promise<StoredChangeSet> {
-    const manifestEntry = await this.kv.get<ChangeSetManifest>(
-      changeSetKey(hash),
-      { consistency: "strong" },
-    );
-    const manifest = manifestEntry.value;
-    if (manifest === null || manifest.encodingVersion !== "change-set-v1") {
+    validateHash(hash, "change set hash");
+    const manifestEntry = await this.kv.get<unknown>(changeSetKey(hash), {
+      consistency: "strong",
+    });
+    if (manifestEntry.value === null) {
       throw new ArchiveCorruptError(`Missing change set ${hash}`);
     }
+    const manifest = validateChangeSetManifest(manifestEntry.value);
 
     const references: Record<ChangeKind, ChangeReference[]> = {
       appeared: [],
@@ -175,22 +181,31 @@ export class KvArchive {
         { length: manifest.pageCounts[kind] },
         (_, index) => changePageKey(hash, kind, index),
       );
-      const entries = await this.getMany<StoredChangePage>(keys);
+      const entries = await this.getMany<unknown>(keys);
       entries.forEach((entry, index) => {
-        if (
-          entry.value === null ||
-          entry.value.encodingVersion !== "change-page-v1" ||
-          entry.value.kind !== kind
-        ) {
+        if (entry.value === null) {
           throw new ArchiveCorruptError(
             `Missing ${kind} page ${index} for change set ${hash}`,
           );
         }
-        references[kind].push(...entry.value.entries);
+        const page = validateChangePage(entry.value, kind);
+        references[kind].push(...page.entries);
       });
       if (references[kind].length !== manifest.counts[kind]) {
         throw new ArchiveCorruptError(`Incorrect ${kind} count for ${hash}`);
       }
+    }
+
+    const expectedHash = await sha256Hex(JSON.stringify([
+      "change-set-v1",
+      manifest.previousRevisionHash,
+      manifest.revisionHash,
+      references,
+    ]));
+    if (expectedHash !== hash) {
+      throw new ArchiveCorruptError(
+        `Change set ${hash} failed hash verification`,
+      );
     }
 
     return {
@@ -207,6 +222,19 @@ export class KvArchive {
     >([HEAD_KEY, PENDING_KEY, observationKey(date)], {
       consistency: "strong",
     });
+    if (head.value !== null) validateHeadRecord(head.value);
+    if (pending.value !== null) validatePendingRecord(pending.value);
+    if (observation.value !== null) {
+      validateObservationRecord(observation.value, date);
+    }
+    if (
+      head.value !== null && pending.value !== null &&
+      pending.value.firstSeenDate <= head.value.date
+    ) {
+      throw new ArchiveCorruptError(
+        "Pending candidate does not follow the head",
+      );
+    }
     return { head, pending, observation };
   }
 
@@ -214,6 +242,49 @@ export class KvArchive {
     control: ArchiveControl,
     pending: PendingCandidate,
   ): Promise<boolean> {
+    validatePendingRecord(pending);
+    if (
+      control.head.value === null ||
+      pending.baseRevisionHash !== control.head.value.revisionHash
+    ) {
+      throw new ArchiveCorruptError(
+        "Pending candidate baseline does not match the archive head",
+      );
+    }
+    const candidateRevision = await this.getRevisionManifest(
+      pending.candidateRevisionHash,
+    );
+    if (candidateRevision.eventCount !== pending.eventCount) {
+      throw new ArchiveCorruptError(
+        "Pending candidate event count does not match its revision",
+      );
+    }
+    const changeSet = await this.loadChangeSet(pending.changeSetHash);
+    if (
+      changeSet.manifest.previousRevisionHash !== pending.baseRevisionHash ||
+      changeSet.manifest.revisionHash !== pending.candidateRevisionHash
+    ) {
+      throw new ArchiveCorruptError(
+        "Pending candidate does not match its change set",
+      );
+    }
+    assertSafeValue(JSON.stringify(pending));
+    if (
+      control.head.value !== null &&
+      pending.firstSeenDate <= control.head.value.date
+    ) {
+      throw new RangeError(
+        "Pending candidate date must follow the archive head",
+      );
+    }
+    if (
+      control.pending.value !== null &&
+      pending.firstSeenDate <= control.pending.value.firstSeenDate
+    ) {
+      throw new RangeError(
+        "Replacement candidate date must follow the pending candidate",
+      );
+    }
     const result = await this.kv.atomic()
       .check(control.head)
       .check(control.pending)
@@ -227,20 +298,40 @@ export class KvArchive {
     control: ArchiveControl,
     input: PublishObservationInput,
   ): Promise<boolean> {
+    if (control.head.value !== null && input.date <= control.head.value.date) {
+      throw new RangeError("Observation date must follow the archive head");
+    }
+    if (
+      control.pending.value !== null &&
+      input.date <= control.pending.value.firstSeenDate
+    ) {
+      throw new RangeError(
+        "Observation date must follow the pending candidate",
+      );
+    }
     const revision = await this.getRevisionManifest(input.revisionHash);
     if (revision.eventCount !== input.eventCount) {
       throw new ArchiveCorruptError(
         "Observation event count does not match revision",
       );
     }
-    if (input.changeSetHash !== null) {
-      const change = await this.kv.get<ChangeSetManifest>(
-        changeSetKey(input.changeSetHash),
-        { consistency: "strong" },
+    const revisionChanged = control.head.value !== null &&
+      control.head.value.revisionHash !== input.revisionHash;
+    if (revisionChanged !== (input.changeSetHash !== null)) {
+      throw new ArchiveCorruptError(
+        "Observation change set does not match its revision transition",
       );
-      if (change.value === null) {
+    }
+    if (input.changeSetHash !== null) {
+      const changeSet = await this.loadChangeSet(input.changeSetHash);
+      if (
+        control.head.value === null ||
+        changeSet.manifest.previousRevisionHash !==
+          control.head.value.revisionHash ||
+        changeSet.manifest.revisionHash !== input.revisionHash
+      ) {
         throw new ArchiveCorruptError(
-          "Observation references a missing change set",
+          "Observation change set does not link its revisions",
         );
       }
     }
@@ -262,6 +353,10 @@ export class KvArchive {
       eventCount: input.eventCount,
       firstObservationDate,
     };
+    validateObservationRecord(observation, input.date);
+    validateHeadRecord(head);
+    assertSafeValue(JSON.stringify(observation));
+    assertSafeValue(JSON.stringify(head));
 
     let atomic = this.kv.atomic()
       .check(control.head)
@@ -373,9 +468,15 @@ export class KvArchive {
       asOf: parseUtcDate(input.asOf),
     }));
     const observations = new Map<string, ObservationRecord | null>();
-    await Promise.all([...new Set(normalized.map((input) => input.asOf))].map(
-      async (date) => observations.set(date, await this.findObservation(date)),
-    ));
+    const requestedDates = [...new Set(normalized.map((input) => input.asOf))];
+    const resolvedObservations = await mapWithConcurrency(
+      requestedDates,
+      MAX_READ_CONCURRENCY,
+      (date) => this.findObservation(date),
+    );
+    requestedDates.forEach((date, index) => {
+      observations.set(date, resolvedObservations[index]!);
+    });
 
     const manifests = new Map<string, RevisionManifest>();
     const coveredRevisions = [
@@ -385,9 +486,25 @@ export class KvArchive {
         ),
       ),
     ];
-    await Promise.all(coveredRevisions.map(async (hash) => {
-      manifests.set(hash, await this.getRevisionManifest(hash));
-    }));
+    const resolvedManifests = await mapWithConcurrency(
+      coveredRevisions,
+      MAX_READ_CONCURRENCY,
+      (hash) => this.getRevisionManifest(hash),
+    );
+    coveredRevisions.forEach((hash, index) => {
+      manifests.set(hash, resolvedManifests[index]!);
+    });
+    for (const observation of observations.values()) {
+      if (
+        observation !== null &&
+        manifests.get(observation.revisionHash)?.eventCount !==
+          observation.eventCount
+      ) {
+        throw new ArchiveCorruptError(
+          "Observation event count does not match its revision",
+        );
+      }
+    }
 
     const work = await Promise.all(normalized.map(async (input, index) => {
       const observation = observations.get(input.asOf) ?? null;
@@ -502,7 +619,7 @@ export class KvArchive {
       : from === null || afterDate >= from
       ? `${afterDate}\u0000`
       : from;
-    const endDate = through === null ? null : nextUtcDate(through);
+    const endDate = through === null ? null : `${through}\u0000`;
     const selector: Deno.KvListSelector = startDate !== null && endDate !== null
       ? { start: changeDateKey(startDate), end: changeDateKey(endDate) }
       : startDate !== null
@@ -511,60 +628,73 @@ export class KvArchive {
       ? { prefix: CHANGE_DATE_PREFIX, end: changeDateKey(endDate) }
       : { prefix: CHANGE_DATE_PREFIX };
     const rows: { date: string; hash: string }[] = [];
-    const iterator = this.kv.list<string>(selector, {
+    const iterator = this.kv.list<unknown>(selector, {
       limit: options.first + 1,
       consistency: "strong",
     });
     for await (const entry of iterator) {
       const date = entry.key.at(-1);
-      if (typeof date !== "string") {
-        throw new ArchiveCorruptError("Change index has an invalid date key");
+      if (typeof date !== "string" || typeof entry.value !== "string") {
+        throw new ArchiveCorruptError("Change index has an invalid entry");
       }
+      parseStoredDate(date, "change index date");
+      validateHash(entry.value, "change index hash");
       rows.push({ date, hash: entry.value });
     }
 
     const hasNextPage = rows.length > options.first;
     const pageRows = rows.slice(0, options.first);
-    const nodes = await Promise.all(pageRows.map(async ({ date, hash }) => {
-      const observationEntry = await this.kv.get<ObservationRecord>(
-        observationKey(date),
-        { consistency: "strong" },
-      );
-      const observation = observationEntry.value;
-      if (
-        observation === null || observation.previousObservationDate === null
-      ) {
-        throw new ArchiveCorruptError(
-          "Change index points to an invalid observation",
+    const nodes = await mapWithConcurrency(
+      pageRows,
+      MAX_READ_CONCURRENCY,
+      async ({ date, hash }) => {
+        const observationEntry = await this.kv.get<ObservationRecord>(
+          observationKey(date),
+          { consistency: "strong" },
         );
-      }
-      const previousEntry = await this.kv.get<ObservationRecord>(
-        observationKey(observation.previousObservationDate),
-        { consistency: "strong" },
-      );
-      const previous = previousEntry.value;
-      if (previous === null) {
-        throw new ArchiveCorruptError(
-          "Change observation has no previous observation",
+        const observation = observationEntry.value;
+        if (observation !== null) validateObservationRecord(observation, date);
+        if (
+          observation === null || observation.previousObservationDate === null
+        ) {
+          throw new ArchiveCorruptError(
+            "Change index points to an invalid observation",
+          );
+        }
+        const previousEntry = await this.kv.get<ObservationRecord>(
+          observationKey(observation.previousObservationDate),
+          { consistency: "strong" },
         );
-      }
-      const manifestEntry = await this.kv.get<ChangeSetManifest>(
-        changeSetKey(hash),
-        { consistency: "strong" },
-      );
-      if (manifestEntry.value === null) {
-        throw new ArchiveCorruptError(
-          "Change index points to a missing change set",
-        );
-      }
-      return {
-        hash,
-        observation: toPublicObservation(observation),
-        previousObservation: toPublicObservation(previous),
-        counts: manifestEntry.value.counts,
-        confirmedAnomaly: observation.confirmedAnomaly,
-      };
-    }));
+        const previous = previousEntry.value;
+        if (previous !== null) {
+          validateObservationRecord(
+            previous,
+            observation.previousObservationDate,
+          );
+        }
+        if (previous === null) {
+          throw new ArchiveCorruptError(
+            "Change observation has no previous observation",
+          );
+        }
+        const changeSet = await this.loadChangeSet(hash);
+        if (
+          changeSet.manifest.previousRevisionHash !== previous.revisionHash ||
+          changeSet.manifest.revisionHash !== observation.revisionHash
+        ) {
+          throw new ArchiveCorruptError(
+            "Change set does not link its observations",
+          );
+        }
+        return {
+          hash,
+          observation: toPublicObservation(observation),
+          previousObservation: toPublicObservation(previous),
+          counts: changeSet.manifest.counts,
+          confirmedAnomaly: observation.confirmedAnomaly,
+        };
+      },
+    );
 
     return {
       nodes,
@@ -576,12 +706,19 @@ export class KvArchive {
   async getEventChanges(
     changeSetHash: string,
     kind: ChangeKind,
-    options: { readonly first: number; readonly afterId?: number },
+    options: {
+      readonly first: number;
+      readonly afterId?: number;
+      readonly changeSet?: StoredChangeSet;
+    },
   ): Promise<EventChangePage> {
     if (options.first < 1 || options.first > 100) {
       throw new RangeError("Event-change page size must be between 1 and 100");
     }
-    const stored = await this.loadChangeSet(changeSetHash);
+    const stored = options.changeSet ?? await this.loadChangeSet(changeSetHash);
+    if (stored.hash !== changeSetHash) {
+      throw new ArchiveCorruptError("Loaded change set has an unexpected hash");
+    }
     const references = referencesFromDiff(stored.diff)[kind];
     const start = options.afterId === undefined
       ? 0
@@ -652,6 +789,7 @@ export class KvArchive {
         latestEventCount: null,
       };
     }
+    validateHeadRecord(head.value);
     const [first, latest] = await this.kv.getMany<
       [ObservationRecord, ObservationRecord]
     >([
@@ -663,10 +801,27 @@ export class KvArchive {
         "Archive head points to a missing observation",
       );
     }
+    validateObservationRecord(first.value, head.value.firstObservationDate);
+    validateObservationRecord(latest.value, head.value.date);
+    if (
+      first.value.previousObservationDate !== null ||
+      latest.value.revisionHash !== head.value.revisionHash ||
+      latest.value.eventCount !== head.value.eventCount
+    ) {
+      throw new ArchiveCorruptError(
+        "Archive head does not match its observations",
+      );
+    }
+    const revision = await this.getRevisionManifest(latest.value.revisionHash);
+    if (revision.eventCount !== latest.value.eventCount) {
+      throw new ArchiveCorruptError(
+        "Latest observation does not match its revision",
+      );
+    }
     return {
       firstObservation: toPublicObservation(first.value),
       latestObservation: toPublicObservation(latest.value),
-      latestEventCount: head.value.eventCount,
+      latestEventCount: latest.value.eventCount,
     };
   }
 
@@ -676,31 +831,39 @@ export class KvArchive {
     const exact = await this.kv.get<ObservationRecord>(observationKey(date), {
       consistency: "strong",
     });
-    if (exact.value !== null) return exact.value;
+    if (exact.value !== null) {
+      validateObservationRecord(exact.value, date);
+      return exact.value;
+    }
 
     const iterator = this.kv.list<ObservationRecord>({
       prefix: OBSERVATION_PREFIX,
-      end: observationKey(nextUtcDate(date)),
+      end: observationKey(`${date}\u0000`),
     }, {
       reverse: true,
       limit: 1,
       consistency: "strong",
     });
-    for await (const entry of iterator) return entry.value;
+    for await (const entry of iterator) {
+      const keyDate = entry.key.at(-1);
+      if (typeof keyDate !== "string") {
+        throw new ArchiveCorruptError("Observation has an invalid key");
+      }
+      validateObservationRecord(entry.value, keyDate);
+      return entry.value;
+    }
     return null;
   }
 
   private async getRevisionManifest(hash: string): Promise<RevisionManifest> {
-    const entry = await this.kv.get<RevisionManifest>(revisionKey(hash), {
+    validateHash(hash, "revision hash");
+    const entry = await this.kv.get<unknown>(revisionKey(hash), {
       consistency: "strong",
     });
-    const manifest = entry.value;
-    if (
-      manifest === null || manifest.encodingVersion !== "revision-v1" ||
-      manifest.bucketHashes.length !== 256
-    ) {
+    if (entry.value === null) {
       throw new ArchiveCorruptError(`Missing revision ${hash}`);
     }
+    const manifest = validateRevisionManifest(entry.value);
     await verifyHash(hash, canonicalRevisionJson(manifest), "revision");
     return manifest;
   }
@@ -772,6 +935,258 @@ export class KvArchive {
     }
     await this.putImmutableChunk(items, attempt + 1);
   }
+}
+
+function validateRevisionManifest(value: unknown): RevisionManifest {
+  const record = recordValue(value, "revision manifest");
+  if (record.encodingVersion !== "revision-v1") {
+    throw new ArchiveCorruptError("Revision has an invalid encoding version");
+  }
+  const eventCount = boundedInteger(
+    record.eventCount,
+    "revision event count",
+    0,
+    MAX_ARCHIVE_EVENT_COUNT,
+  );
+  if (
+    !Array.isArray(record.bucketHashes) || record.bucketHashes.length !== 256
+  ) {
+    throw new ArchiveCorruptError("Revision must contain 256 bucket hashes");
+  }
+  const bucketHashes = record.bucketHashes.map((hash) => {
+    validateHash(hash, "bucket hash");
+    return hash;
+  });
+  return { encodingVersion: "revision-v1", eventCount, bucketHashes };
+}
+
+function validateChangeSetManifest(value: unknown): ChangeSetManifest {
+  const record = recordValue(value, "change-set manifest");
+  if (record.encodingVersion !== "change-set-v1") {
+    throw new ArchiveCorruptError("Change set has an invalid encoding version");
+  }
+  validateHash(record.previousRevisionHash, "previous revision hash");
+  validateHash(record.revisionHash, "revision hash");
+  const countsRecord = recordValue(record.counts, "change counts");
+  const pageCountsRecord = recordValue(record.pageCounts, "change page counts");
+  const counts: Record<ChangeKind, number> = {
+    appeared: 0,
+    disappeared: 0,
+    updated: 0,
+  };
+  const pageCounts: Record<ChangeKind, number> = {
+    appeared: 0,
+    disappeared: 0,
+    updated: 0,
+  };
+  for (const kind of changeKinds()) {
+    counts[kind] = boundedInteger(
+      countsRecord[kind],
+      `${kind} change count`,
+      0,
+      MAX_ARCHIVE_EVENT_COUNT,
+    );
+    pageCounts[kind] = boundedInteger(
+      pageCountsRecord[kind],
+      `${kind} page count`,
+      0,
+      Math.ceil(MAX_ARCHIVE_EVENT_COUNT / CHANGE_PAGE_ITEMS),
+    );
+    if (pageCounts[kind] !== Math.ceil(counts[kind] / CHANGE_PAGE_ITEMS)) {
+      throw new ArchiveCorruptError(`${kind} page count is inconsistent`);
+    }
+  }
+  if (
+    counts.appeared + counts.disappeared + counts.updated >
+      2 * MAX_ARCHIVE_EVENT_COUNT
+  ) {
+    throw new ArchiveCorruptError("Change set contains too many events");
+  }
+  return {
+    encodingVersion: "change-set-v1",
+    previousRevisionHash: record.previousRevisionHash,
+    revisionHash: record.revisionHash,
+    counts,
+    pageCounts,
+  };
+}
+
+function validateChangePage(
+  value: unknown,
+  expectedKind: ChangeKind,
+): StoredChangePage {
+  const record = recordValue(value, "change page");
+  if (
+    record.encodingVersion !== "change-page-v1" ||
+    record.kind !== expectedKind ||
+    !Array.isArray(record.entries) || record.entries.length > CHANGE_PAGE_ITEMS
+  ) {
+    throw new ArchiveCorruptError(`Invalid ${expectedKind} change page`);
+  }
+  const entries = record.entries.map((value, index): ChangeReference => {
+    const entry = recordValue(value, `${expectedKind} change ${index}`);
+    const id = boundedInteger(entry.id, "change event ID", 1, 2_147_483_647);
+    const beforeHash = nullableHash(entry.beforeHash, "before event hash");
+    const afterHash = nullableHash(entry.afterHash, "after event hash");
+    if (!Array.isArray(entry.changedFields)) {
+      throw new ArchiveCorruptError("Change fields must be an array");
+    }
+    const changedFields = entry.changedFields.map((field) => {
+      if (!isEventField(field)) {
+        throw new ArchiveCorruptError("Change contains an invalid field");
+      }
+      return field;
+    });
+    if (new Set(changedFields).size !== changedFields.length) {
+      throw new ArchiveCorruptError("Change contains duplicate fields");
+    }
+    const validShape = expectedKind === "appeared"
+      ? beforeHash === null && afterHash !== null && changedFields.length === 0
+      : expectedKind === "disappeared"
+      ? beforeHash !== null && afterHash === null && changedFields.length === 0
+      : beforeHash !== null && afterHash !== null;
+    if (!validShape) {
+      throw new ArchiveCorruptError(`Invalid ${expectedKind} change shape`);
+    }
+    return { id, beforeHash, afterHash, changedFields };
+  });
+  return { encodingVersion: "change-page-v1", kind: expectedKind, entries };
+}
+
+function validateObservationRecord(value: unknown, keyDate: string): void {
+  const record = recordValue(value, "observation");
+  const date = parseStoredDate(record.date, "observation date");
+  if (date !== parseStoredDate(keyDate, "observation key date")) {
+    throw new ArchiveCorruptError("Observation date does not match its key");
+  }
+  if (
+    typeof record.fetchedAt !== "string" ||
+    !isCanonicalDateTime(record.fetchedAt)
+  ) {
+    throw new ArchiveCorruptError("Observation has an invalid fetch timestamp");
+  }
+  validateHash(record.revisionHash, "observation revision hash");
+  if (record.previousObservationDate !== null) {
+    const previousDate = parseStoredDate(
+      record.previousObservationDate,
+      "previous observation date",
+    );
+    if (previousDate >= date) {
+      throw new ArchiveCorruptError("Observation chronology is invalid");
+    }
+  }
+  boundedInteger(
+    record.eventCount,
+    "observation event count",
+    0,
+    MAX_ARCHIVE_EVENT_COUNT,
+  );
+  if (
+    record.sourceEtag !== null &&
+    (typeof record.sourceEtag !== "string" ||
+      new TextEncoder().encode(record.sourceEtag).byteLength > 1_024)
+  ) {
+    throw new ArchiveCorruptError("Observation has an invalid ETag");
+  }
+  if (typeof record.confirmedAnomaly !== "boolean") {
+    throw new ArchiveCorruptError("Observation has an invalid anomaly flag");
+  }
+}
+
+function validateHeadRecord(value: unknown): void {
+  const record = recordValue(value, "archive head");
+  const date = parseStoredDate(record.date, "head date");
+  const firstDate = parseStoredDate(
+    record.firstObservationDate,
+    "first observation date",
+  );
+  if (firstDate > date) {
+    throw new ArchiveCorruptError("Archive head dates are inconsistent");
+  }
+  validateHash(record.revisionHash, "head revision hash");
+  boundedInteger(
+    record.eventCount,
+    "head event count",
+    0,
+    MAX_ARCHIVE_EVENT_COUNT,
+  );
+}
+
+function validatePendingRecord(value: unknown): void {
+  const record = recordValue(value, "pending candidate");
+  parseStoredDate(record.firstSeenDate, "pending candidate date");
+  validateHash(record.baseRevisionHash, "pending base revision hash");
+  validateHash(record.candidateRevisionHash, "pending revision hash");
+  validateHash(record.changeSetHash, "pending change-set hash");
+  boundedInteger(
+    record.eventCount,
+    "pending event count",
+    0,
+    MAX_ARCHIVE_EVENT_COUNT,
+  );
+}
+
+function recordValue(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ArchiveCorruptError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function boundedInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    !Number.isSafeInteger(value) || (value as number) < minimum ||
+    (value as number) > maximum
+  ) {
+    throw new ArchiveCorruptError(`${label} is outside its valid range`);
+  }
+  return value as number;
+}
+
+function validateHash(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
+    throw new ArchiveCorruptError(`${label} is invalid`);
+  }
+}
+
+function nullableHash(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  validateHash(value, label);
+  return value;
+}
+
+function parseStoredDate(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new ArchiveCorruptError(`${label} must be a string`);
+  }
+  try {
+    return parseUtcDate(value);
+  } catch {
+    throw new ArchiveCorruptError(`${label} is invalid`);
+  }
+}
+
+function isCanonicalDateTime(value: string): boolean {
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date.toISOString() === value;
+}
+
+function isEventField(value: unknown): value is EventField {
+  return typeof value === "string" && [
+    "SLUG",
+    "NAME",
+    "SHORT_NAME",
+    "LOCALISED_NAME",
+    "LOCATION",
+    "COORDINATES",
+    "COUNTRY",
+    "SERIES",
+  ].includes(value);
 }
 
 function referencesFromDiff(
@@ -886,7 +1301,7 @@ function findBucketEntry(
   while (low <= high) {
     const middle = Math.floor((low + high) / 2);
     const entry = entries[middle]!;
-    const comparison = entry.slug.localeCompare(slug);
+    const comparison = compareSlugs(entry.slug, slug);
     if (comparison === 0) return entry;
     if (comparison < 0) low = middle + 1;
     else high = middle - 1;

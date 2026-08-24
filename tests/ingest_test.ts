@@ -67,6 +67,68 @@ Deno.test("IngestionService accepts a baseline and a normal update", async () =>
   }
 });
 
+Deno.test("IngestionService never moves the archive head to an older date", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    let fetches = 0;
+    const service = new IngestionService(archive, () => {
+      fetches += 1;
+      return Promise.resolve(fetched([event(1)], "2026-08-02"));
+    });
+
+    await service.run("2026-08-02");
+    assertEquals(await service.run("2026-08-01"), {
+      status: "SKIPPED_OUT_OF_ORDER",
+      date: "2026-08-01",
+      latestDate: "2026-08-02",
+    });
+    assertEquals(fetches, 1);
+    assertEquals(
+      (await archive.getArchiveInfo()).latestObservation?.date,
+      "2026-08-02",
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("an older run cannot confirm or replace a newer pending anomaly", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    const baseline = Array.from(
+      { length: 202 },
+      (_, index) => event(index + 1),
+    );
+    const pendingCandidate = baseline.slice(101);
+    let fetches = 0;
+    const queue = [
+      fetched(baseline, "2026-08-01"),
+      fetched(pendingCandidate, "2026-08-03"),
+    ];
+    const service = new IngestionService(archive, () => {
+      fetches += 1;
+      return Promise.resolve(queue.shift()!);
+    });
+
+    await service.run("2026-08-01");
+    await service.run("2026-08-03");
+    assertEquals(await service.run("2026-08-02"), {
+      status: "SKIPPED_OUT_OF_ORDER",
+      date: "2026-08-02",
+      latestDate: "2026-08-03",
+    });
+    assertEquals(fetches, 2);
+    assertEquals(
+      (await archive.readControl("2026-08-04")).pending.value?.firstSeenDate,
+      "2026-08-03",
+    );
+  } finally {
+    kv.close();
+  }
+});
+
 Deno.test("IngestionService confirms a mass change on a later valid run", async () => {
   const kv = await Deno.openKv(":memory:");
   try {
@@ -108,6 +170,43 @@ Deno.test("IngestionService confirms a mass change on a later valid run", async 
     ]);
     assertEquals(missing!.status, "NOT_FOUND");
     assertEquals(present!.status, "FOUND");
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("a transient mass change is discarded when the next feed recovers", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    const baseline = Array.from(
+      { length: 202 },
+      (_, index) => event(index + 1),
+    );
+    const transient = baseline.slice(101);
+    const queue = [
+      fetched(baseline, "2026-08-01"),
+      fetched(transient, "2026-08-02"),
+      fetched(baseline, "2026-08-03"),
+    ];
+    const service = new IngestionService(
+      archive,
+      () => Promise.resolve(queue.shift()!),
+    );
+
+    await service.run("2026-08-01");
+    assertEquals(
+      (await service.run("2026-08-02")).status,
+      "PENDING_CONFIRMATION",
+    );
+    assertEquals(await service.run("2026-08-03"), {
+      status: "ACCEPTED",
+      date: "2026-08-03",
+      eventCount: 202,
+      changeCount: 0,
+      confirmedAnomaly: false,
+    });
+    assertEquals((await archive.readControl("2026-08-04")).pending.value, null);
   } finally {
     kv.close();
   }

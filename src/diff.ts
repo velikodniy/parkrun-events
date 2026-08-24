@@ -22,9 +22,7 @@ export function confirmsPendingChanges(
   candidateEventsById: ReadonlyMap<number, HashedEvent>,
 ): boolean {
   for (const change of pending.appeared) {
-    if (candidateEventsById.get(change.id)?.hash !== change.afterHash) {
-      return false;
-    }
+    if (!candidateEventsById.has(change.id)) return false;
   }
   for (const change of pending.disappeared) {
     if (candidateEventsById.has(change.id)) return false;

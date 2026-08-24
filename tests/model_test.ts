@@ -2,6 +2,7 @@ import { assertEquals, assertNotEquals } from "@std/assert";
 import {
   buildRevision,
   canonicalEventJson,
+  compareSlugs,
   diffRevisions,
 } from "../src/model.ts";
 import type { EventRecord } from "../src/model.ts";
@@ -27,6 +28,15 @@ Deno.test("canonical event encoding is stable and field ordered", () => {
     canonicalEventJson(event(1, "alpha")),
     canonicalEventJson({ ...event(1, "alpha") }),
   );
+});
+
+Deno.test("slug ordering uses locale-independent code unit order", () => {
+  assertEquals(["a1", "b", "a-1", "a"].sort(compareSlugs), [
+    "a",
+    "a-1",
+    "a1",
+    "b",
+  ]);
 });
 
 Deno.test("buildRevision is independent of source event order", async () => {
