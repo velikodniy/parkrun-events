@@ -1,5 +1,6 @@
 import { assertEquals, assertExists } from "@std/assert";
 import { getIntrospectionQuery } from "graphql";
+import { ChangeFeed } from "../src/change_feed.ts";
 import { ChangeReadModel } from "../src/change_views.ts";
 import { createGraphqlServer } from "../src/graphql.ts";
 import { KvArchive } from "../src/kv_archive.ts";
@@ -365,7 +366,9 @@ Deno.test("GraphQL change views default to all countries and expose event histor
     );
     const views = new ChangeReadModel(kv);
     await views.synchronize(archive, { apply: true });
-    const server = createGraphqlServer(archive, views);
+    const feed = new ChangeFeed(kv);
+    await feed.synchronize(views, { apply: true });
+    const server = createGraphqlServer(archive, views, feed);
 
     assertEquals(
       await execute(
@@ -482,6 +485,32 @@ Deno.test("GraphQL change views default to all countries and expose event histor
         },
       },
     );
+
+    const nestedQuery = `
+      query Nested($countryCode: Int, $after: String) {
+        catalogueChanges(countryCode: $countryCode) {
+          nodes {
+            appeared(first: 1, after: $after) {
+              pageInfo { endCursor }
+            }
+          }
+        }
+      }
+    `;
+    const globalNested = await execute(server, nestedQuery);
+    const nestedCursor = (((((globalNested.data as Record<string, unknown>)
+      .catalogueChanges as Record<string, unknown>).nodes as Array<
+        Record<string, unknown>
+      >)[0]!.appeared as Record<string, unknown>).pageInfo as Record<
+        string,
+        unknown
+      >).endCursor;
+    assertExists(nestedCursor);
+    const wrongNestedCountry = await execute(server, nestedQuery, {
+      countryCode: 3,
+      after: nestedCursor,
+    });
+    assertExists(wrongNestedCountry.errors);
   } finally {
     kv.close();
   }
@@ -496,7 +525,9 @@ Deno.test("GraphQL event-history cursors are scoped to one event", async () => {
     await publish(archive, [event(1, "three")], "2026-08-03");
     const views = new ChangeReadModel(kv);
     await views.synchronize(archive, { apply: true });
-    const server = createGraphqlServer(archive, views);
+    const feed = new ChangeFeed(kv);
+    await feed.synchronize(views, { apply: true });
+    const server = createGraphqlServer(archive, views, feed);
     const query = `
       query History($eventId: Int!, $after: String) {
         eventChanges(eventId: $eventId, first: 1, after: $after) {
@@ -545,6 +576,14 @@ Deno.test("GraphQL event-history cursors are scoped to one event", async () => {
         unknown
       >;
     assertExists(globalPage.endCursor);
+    const cursorPayload = decodeTestCursor(globalPage.endCursor as string);
+    assertEquals(cursorPayload.version, 1);
+    cursorPayload.resumeMonth = "0000-01";
+    const rewound = await execute(server, catalogueQuery, {
+      after: encodeTestCursor(cursorPayload),
+    });
+    assertExists(rewound.errors);
+
     const wrongCountry = await execute(server, catalogueQuery, {
       countryCode: 97,
       after: globalPage.endCursor,
@@ -554,6 +593,19 @@ Deno.test("GraphQL event-history cursors are scoped to one event", async () => {
     kv.close();
   }
 });
+
+function decodeTestCursor(cursor: string): Record<string, unknown> {
+  const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+  const padding = "=".repeat((4 - base64.length % 4) % 4);
+  return JSON.parse(atob(base64 + padding)) as Record<string, unknown>;
+}
+
+function encodeTestCursor(value: Record<string, unknown>): string {
+  return btoa(JSON.stringify(value))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
 
 Deno.test("GraphQL supports standard schema introspection", async () => {
   const kv = await Deno.openKv(":memory:");

@@ -307,9 +307,11 @@ index.
 Outer change-set pages and inner change pages accept 1 through 100 items. Change
 sets sort by observation date; changes within a set sort by numeric event ID.
 
-Cursors are opaque, versioned base64url values containing the connection kind,
-filter fingerprint, and last sort key. A cursor from one date range or change
-kind is invalid for another. Cursor input length is bounded before decoding.
+Cursors are opaque version-1 base64url values containing the connection kind,
+filter fingerprint, and last sort key. A cursor from one date range, country,
+projection, or change kind is invalid for another. Cursor input length is
+bounded before decoding. Internal `read-v2` and `read-v3` names are storage
+schema generations, not public API versions.
 
 ## Deno KV model
 
@@ -400,46 +402,58 @@ No key in accepted history has a TTL.
 
 ### Materialized change views
 
-Canonical change sets remain the source of truth. Query-specific records under
-`["parkrun-events", "read-v2", ...]` duplicate complete before and after event
-values so public queries do not fan out across normalized records.
+Canonical change sets remain the source of truth. The `read-v2` projection keeps
+complete per-event history and independently rebuildable date and country
+records:
 
 ```text
-["read-v2", "catalogue", "all", date] -> global summary
-["read-v2", "catalogue", "country", countryCode, date] -> filtered summary
-["read-v2", "detail", "all", changeSetHash, kind, page] -> global changes
-["read-v2", "detail", "country", countryCode, changeSetHash, kind, page]
-["read-v2", "event", eventId, date] -> one complete event transition
-["read-v2", "meta", "watermark"] -> latest fully projected date
+["read-v2", "catalogue", "all", date]
+["read-v2", "catalogue", "country", countryCode, date]
+["read-v2", "detail", scope, changeSetHash, kind, page]
+["read-v2", "event", eventId, date]
+["read-v2", "meta", "watermark"]
 ```
 
-Stored event and change values use compact versioned tuples. Detail pages are
-packed by encoded UTF-8 bytes toward 3,500 bytes. This target stays below Deno
-KV's 4 KiB read-unit boundary with serialization margin. If one pathological
-change exceeds the target it occupies a page alone; every value still has a hard
-48 KiB ceiling. Confirmed mass changes therefore create more bounded pages
-instead of oversized values.
+The chronological catalogue query uses a second, query-shaped `read-v3`
+projection. One value normally contains a complete month of summaries and full
+before/after changes:
+
+```text
+["read-v3", "feed", "all", month]
+["read-v3", "feed", "country", countryCode, month]
+["read-v3", "page", scope, month, generationHash, page]
+["read-v3", "meta", "watermark"]
+```
+
+Month payloads use compact versioned tuples and gzip. Their binary envelope
+contains a magic/version marker, bounded decompressed length, and SHA-256 of the
+uncompressed JSON. Inline values target at most 3,500 bytes, below Deno KV's 4
+KiB read-unit boundary. A month that does not fit switches atomically to a small
+generation directory and immutable compressed pages. Mass-change dates split
+into ordered fragments. One incompressible event can occupy a page alone, but
+every stored value stays below 48 KiB and decompression is bounded to 64 KiB per
+page.
 
 Country membership uses the after-country for appearances, the before-country
 for disappearances, and the union of both countries for updates. A move is
 visible under both countries without duplication within either. Omitting or
-passing null for `countryCode` selects the global view.
+passing null for `countryCode` selects the global feed.
 
-Derived records are staged idempotently before the watermark advances. Readers
-cap date, country, and event results at the watermark, so interruption can leave
-only invisible records. A retry verifies and reuses them. Daily ingestion
-synchronizes the view after canonical publication; no-change observations
-advance only the watermark.
+Both projections stage data before advancing their own watermark. Readers cap
+results at the watermark, so interruption exposes neither partial months nor
+partial mass changes. Retries verify and reuse staged records. Daily ingestion
+synchronizes `read-v2`, then `read-v3`, after canonical publication. No-change
+observations advance only the watermarks.
 
-The initial historical projection is built by a temporary validation-first
-backfill command. The reusable projector stays in production, but the one-off
-script and task are removed after production verification.
+The historical `read-v3` projection is built by a temporary validation-first
+backfill command. Its reusable projector stays in production; the one-off script
+and task are removed after production verification.
 
-Against the 42 imported observations, the projection contains 642 records and
-about 260 KiB of encoded values; its largest normal value is about 2.3 KiB. The
-README `RecentChanges` query for the four August change dates uses 16 estimated
-4 KiB read units instead of roughly 200. A regression test fixes the equivalent
-single-date query at five units: watermark, summary, and three detail pages.
+Against the 42 imported observations, `read-v3` contains 85 records and about 50
+KiB. Its largest value is about 2.6 KiB; every current month is inline. The full
+January-through-August README query uses 11 estimated 4 KiB read units over two
+GraphQL pages, down from 120 with `read-v2` and roughly 200 with the original
+normalized read path.
 
 ## Ingestion algorithm
 

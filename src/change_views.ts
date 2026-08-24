@@ -357,6 +357,32 @@ export class ChangeReadModel {
     };
   }
 
+  async getAllEventChanges(
+    summary: ViewCatalogueChangeSummary,
+  ): Promise<Readonly<Record<ChangeKind, readonly EventChangeNode[]>>> {
+    const result: Record<ChangeKind, EventChangeNode[]> = {
+      appeared: [],
+      disappeared: [],
+      updated: [],
+    };
+    for (const kind of CHANGE_KINDS) {
+      let after: ViewEventChangePosition | undefined;
+      while (true) {
+        const page = await this.getEventChanges(summary, kind, {
+          first: 100,
+          ...(after === undefined ? {} : { after }),
+        });
+        result[kind].push(...page.nodes);
+        if (!page.hasNextPage || page.endPosition === null) break;
+        after = page.endPosition;
+      }
+      if (result[kind].length !== summary.counts[kind]) {
+        throw new Error(`Materialized ${kind} count is inconsistent`);
+      }
+    }
+    return result;
+  }
+
   private async readDetailPage(
     summary: ViewCatalogueChangeSummary,
     kind: ChangeKind,

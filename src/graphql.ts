@@ -23,6 +23,7 @@ import type {
   EventLookupInput,
   StoredChangeSet,
 } from "./archive.ts";
+import { ChangeFeed, type FeedCatalogueChangeSummary } from "./change_feed.ts";
 import {
   ChangeReadModel,
   type ViewCatalogueChangeSummary,
@@ -225,12 +226,13 @@ interface EventHistoryArguments {
 }
 
 interface ChangeSetCursor {
-  readonly version: 2;
+  readonly version: 1;
   readonly connection: "catalogue-changes";
   readonly from: string | null;
   readonly through: string | null;
   readonly countryCode: number | null;
   readonly lastDate: string;
+  readonly resumeMonth?: string;
 }
 
 interface GraphqlContext {
@@ -244,17 +246,16 @@ interface EventChangeCursor {
   readonly connection: "event-changes";
   readonly changeSetHash: string;
   readonly kind: ChangeKind;
+  readonly projection: "canonical" | "feed" | "view";
+  readonly countryCode: number | null;
+  readonly page?: number;
+  readonly offset?: number;
   readonly lastId: number;
 }
 
-interface ViewEventChangeCursor {
-  readonly version: 2;
-  readonly connection: "event-changes";
-  readonly changeSetHash: string;
-  readonly kind: ChangeKind;
-  readonly page: number;
-  readonly offset: number;
-  readonly lastId: number;
+interface EventCursorScope {
+  readonly projection: "canonical" | "feed" | "view";
+  readonly countryCode: number | null;
 }
 
 interface EventHistoryCursor {
@@ -269,6 +270,7 @@ interface EventHistoryCursor {
 export function createGraphqlServer(
   archive: KvArchive,
   changeViews?: ChangeReadModel,
+  changeFeed?: ChangeFeed,
 ) {
   const resolveEventChanges = async (
     parent: CatalogueChangeSummary,
@@ -277,12 +279,26 @@ export function createGraphqlServer(
     context: GraphqlContext,
   ) => {
     validatePageSize(arguments_.first);
+    const cursorScope: EventCursorScope = isFeedSummary(parent)
+      ? { projection: "feed", countryCode: parent.feedCountryCode }
+      : isViewSummary(parent)
+      ? { projection: "view", countryCode: parent.viewCountryCode }
+      : { projection: "canonical", countryCode: null };
     const after = arguments_.after === undefined || arguments_.after === null
       ? undefined
-      : decodeEventChangeCursor(arguments_.after, parent.hash, kind);
+      : decodeEventChangeCursor(
+        arguments_.after,
+        parent.hash,
+        kind,
+        cursorScope,
+      );
     const pageKey = JSON.stringify([
       parent.hash,
-      isViewSummary(parent) ? parent.viewCountryCode : "canonical",
+      isFeedSummary(parent)
+        ? parent.feedCountryCode
+        : isViewSummary(parent)
+        ? parent.viewCountryCode
+        : "canonical",
       kind,
       arguments_.first,
       after ?? null,
@@ -290,6 +306,15 @@ export function createGraphqlServer(
     let pagePromise = context.eventChangePages.get(pageKey);
     if (pagePromise === undefined) {
       pagePromise = context.archiveSemaphore.run(async () => {
+        if (isFeedSummary(parent)) {
+          if (changeFeed === undefined) {
+            throw new Error("Packed change feed is unavailable");
+          }
+          return changeFeed.getEventChanges(parent, kind, {
+            first: arguments_.first,
+            ...(after === undefined ? {} : { afterId: after.lastId }),
+          });
+        }
         if (isViewSummary(parent)) {
           if (changeViews === undefined) {
             throw new Error("Materialized change view is unavailable");
@@ -322,21 +347,35 @@ export function createGraphqlServer(
       pageInfo: {
         hasNextPage: page.hasNextPage,
         endCursor: page.endId === null ? null : encodeCursor(
-          viewPosition === null
+          isFeedSummary(parent)
             ? {
               version: 1,
               connection: "event-changes",
               changeSetHash: parent.hash,
               kind,
+              projection: "feed",
+              countryCode: parent.feedCountryCode,
               lastId: page.endId,
             } satisfies EventChangeCursor
-            : {
-              version: 2,
+            : viewPosition !== null && isViewSummary(parent)
+            ? {
+              version: 1,
               connection: "event-changes",
               changeSetHash: parent.hash,
               kind,
+              projection: "view",
+              countryCode: parent.viewCountryCode,
               ...viewPosition,
-            } satisfies ViewEventChangeCursor,
+            } satisfies EventChangeCursor
+            : {
+              version: 1,
+              connection: "event-changes",
+              changeSetHash: parent.hash,
+              kind,
+              projection: "canonical",
+              countryCode: null,
+              lastId: page.endId,
+            } satisfies EventChangeCursor,
         ),
       },
     };
@@ -391,7 +430,7 @@ export function createGraphqlServer(
           const countryCode = arguments_.countryCode ?? null;
           const from = arguments_.from ?? null;
           const through = arguments_.through ?? null;
-          const afterDate = arguments_.after === undefined ||
+          const after = arguments_.after === undefined ||
               arguments_.after === null
             ? undefined
             : decodeChangeSetCursor(
@@ -400,41 +439,66 @@ export function createGraphqlServer(
               from,
               through,
             );
-          const page = await context.archiveSemaphore.run(() =>
-            changeViews === undefined
-              ? countryCode === null
-                ? archive.listCatalogueChanges({
-                  first: arguments_.first,
-                  ...(from === null ? {} : { from }),
-                  ...(through === null ? {} : { through }),
-                  ...(afterDate === undefined ? {} : { afterDate }),
-                })
-                : Promise.reject(
-                  new GraphQLError("Country filtering is not available", {
-                    extensions: { code: "CHANGE_VIEW_NOT_READY" },
-                  }),
-                )
-              : changeViews.listCatalogueChanges({
+          const page = await context.archiveSemaphore.run(() => {
+            if (changeFeed !== undefined) {
+              return changeFeed.listCatalogueChanges({
                 first: arguments_.first,
                 ...(countryCode === null ? {} : { countryCode }),
                 ...(from === null ? {} : { from }),
                 ...(through === null ? {} : { through }),
-                ...(afterDate === undefined ? {} : { afterDate }),
-              })
-          );
+                ...(after === undefined ? {} : { afterDate: after.lastDate }),
+                ...(after?.resumeMonth === undefined
+                  ? {}
+                  : { startMonth: after.resumeMonth }),
+              });
+            }
+            if (changeViews !== undefined) {
+              return changeViews.listCatalogueChanges({
+                first: arguments_.first,
+                ...(countryCode === null ? {} : { countryCode }),
+                ...(from === null ? {} : { from }),
+                ...(through === null ? {} : { through }),
+                ...(after === undefined ? {} : { afterDate: after.lastDate }),
+              });
+            }
+            if (countryCode !== null) {
+              return Promise.reject(
+                new GraphQLError("Country filtering is not available", {
+                  extensions: { code: "CHANGE_VIEW_NOT_READY" },
+                }),
+              );
+            }
+            return archive.listCatalogueChanges({
+              first: arguments_.first,
+              ...(from === null ? {} : { from }),
+              ...(through === null ? {} : { through }),
+              ...(after === undefined ? {} : { afterDate: after.lastDate }),
+            });
+          });
           return {
             nodes: page.nodes,
             pageInfo: {
               hasNextPage: page.hasNextPage,
               endCursor: page.endDate === null ? null : encodeCursor(
-                {
-                  version: 2,
-                  connection: "catalogue-changes",
-                  countryCode,
-                  from,
-                  through,
-                  lastDate: page.endDate,
-                } satisfies ChangeSetCursor,
+                "resumeMonth" in page &&
+                  typeof page.resumeMonth === "string"
+                  ? {
+                    version: 1,
+                    connection: "catalogue-changes",
+                    countryCode,
+                    from,
+                    through,
+                    lastDate: page.endDate,
+                    resumeMonth: page.resumeMonth,
+                  } satisfies ChangeSetCursor
+                  : {
+                    version: 1,
+                    connection: "catalogue-changes",
+                    countryCode,
+                    from,
+                    through,
+                    lastDate: page.endDate,
+                  } satisfies ChangeSetCursor,
               ),
             },
           };
@@ -759,11 +823,7 @@ function validatePageSize(first: number): void {
 }
 
 function encodeCursor(
-  value:
-    | ChangeSetCursor
-    | EventChangeCursor
-    | ViewEventChangeCursor
-    | EventHistoryCursor,
+  value: ChangeSetCursor | EventChangeCursor | EventHistoryCursor,
 ): string {
   return btoa(JSON.stringify(value))
     .replaceAll("+", "-")
@@ -776,20 +836,26 @@ function decodeChangeSetCursor(
   countryCode: number | null,
   from: string | null,
   through: string | null,
-): string {
+): { readonly lastDate: string; readonly resumeMonth?: string } {
   const value = decodeCursor(cursor);
-  const compatibleV1 = value.version === 1 && countryCode === null;
-  const compatibleV2 = value.version === 2 &&
-    value.countryCode === countryCode;
+  const resumeMonth = value.resumeMonth;
   if (
-    value.connection !== "catalogue-changes" ||
-    (!compatibleV1 && !compatibleV2) || value.from !== from ||
-    value.through !== through || typeof value.lastDate !== "string"
+    value.version !== 1 || value.connection !== "catalogue-changes" ||
+    value.countryCode !== countryCode || value.from !== from ||
+    value.through !== through || typeof value.lastDate !== "string" ||
+    (resumeMonth !== undefined &&
+      (typeof resumeMonth !== "string" ||
+        !/^\d{4}-(?:0[1-9]|1[0-2])$/u.test(resumeMonth)))
   ) {
     throw invalidCursor();
   }
   try {
-    return parseUtcDate(value.lastDate);
+    const lastDate = parseUtcDate(value.lastDate);
+    if (typeof resumeMonth === "string") {
+      if (resumeMonth < lastDate.slice(0, 7)) throw invalidCursor();
+      return { lastDate, resumeMonth };
+    }
+    return { lastDate };
   } catch {
     throw invalidCursor();
   }
@@ -799,20 +865,27 @@ function decodeEventChangeCursor(
   cursor: string,
   changeSetHash: string,
   kind: ChangeKind,
+  expectedScope: EventCursorScope,
 ): { readonly lastId: number; readonly position?: ViewEventChangePosition } {
   const value = decodeCursor(cursor);
   if (
-    value.connection !== "event-changes" ||
+    value.version !== 1 || value.connection !== "event-changes" ||
     value.changeSetHash !== changeSetHash || value.kind !== kind ||
+    value.projection !== expectedScope.projection ||
+    value.countryCode !== expectedScope.countryCode ||
     !Number.isSafeInteger(value.lastId) || (value.lastId as number) < 0
   ) {
     throw invalidCursor();
   }
-  if (value.version === 1) return { lastId: value.lastId as number };
+  if (expectedScope.projection !== "view") {
+    if (value.page !== undefined || value.offset !== undefined) {
+      throw invalidCursor();
+    }
+    return { lastId: value.lastId as number };
+  }
   if (
-    value.version !== 2 || !Number.isSafeInteger(value.page) ||
-    (value.page as number) < 0 || !Number.isSafeInteger(value.offset) ||
-    (value.offset as number) < 0
+    !Number.isSafeInteger(value.page) || (value.page as number) < 0 ||
+    !Number.isSafeInteger(value.offset) || (value.offset as number) < 0
   ) {
     throw invalidCursor();
   }
@@ -845,6 +918,12 @@ function decodeEventHistoryCursor(
   } catch {
     throw invalidCursor();
   }
+}
+
+function isFeedSummary(
+  value: CatalogueChangeSummary,
+): value is FeedCatalogueChangeSummary {
+  return "feedChanges" in value && "feedCountryCode" in value;
 }
 
 function isViewSummary(

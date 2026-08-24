@@ -1,4 +1,5 @@
 import { createApp } from "./app.ts";
+import { ChangeFeed } from "./change_feed.ts";
 import { ChangeReadModel } from "./change_views.ts";
 import { utcDateOf } from "./date.ts";
 import { IngestionService } from "./ingest.ts";
@@ -9,6 +10,7 @@ const kvPath = Deno.env.get("KV_PATH");
 const kv = await Deno.openKv(kvPath);
 const archive = new KvArchive(kv);
 const changeViews = new ChangeReadModel(kv);
+const changeFeed = new ChangeFeed(kv);
 const ingestion = new IngestionService(archive, fetchEventsCatalogue);
 const ingestionEnabled = Deno.env.get("ENABLE_INGESTION") === "true";
 
@@ -27,11 +29,14 @@ Deno.cron(
       const changeView = await changeViews.synchronize(archive, {
         apply: true,
       });
+      const feed = await changeFeed.synchronize(changeViews, { apply: true });
       log({
         event: "ingestion_finished",
         durationMs: Math.round(performance.now() - startedAt),
         changeViewThroughDate: changeView.throughDate,
         indexedChangeDates: changeView.changeDates,
+        changeFeedThroughDate: feed.throughDate,
+        packedChangeDates: feed.changeDates,
         ...outcome,
       });
     } catch (error) {
@@ -45,7 +50,7 @@ Deno.cron(
   },
 );
 
-Deno.serve(createApp(archive, { changeViews }));
+Deno.serve(createApp(archive, { changeViews, changeFeed }));
 
 function log(value: Record<string, unknown>): void {
   console.log(
