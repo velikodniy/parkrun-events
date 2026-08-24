@@ -1,777 +1,308 @@
-# parkrun events archive — design
+# parkrun events archive
 
-## Goal
+## Purpose
 
-Build a small, read-only GraphQL service that remembers the public parkrun event
-catalogue over time.
+This service keeps a dated archive of the public parkrun event catalogue. It
+runs on Deno Deploy, reads `https://images.parkrun.com/events.json`, and stores
+accepted observations in Deno KV.
 
-The service will run on Deno Deploy at `parkrun-events.vlcdn.dev`, fetch
-`https://images.parkrun.com/events.json` every day, and store accepted
-observations in Deno KV. It will answer:
+The public GraphQL API answers:
 
-- What metadata did a slug have as of a given UTC date?
-- What did several slug/date pairs look like in one request?
-- Which events appeared, disappeared, or changed between accepted observations?
+- what metadata a slug had on a UTC date;
+- several independent slug/date lookups in one ordered batch;
+- which events appeared, disappeared, or changed over time;
+- the complete change history for one numeric event ID.
 
-History starts with the earliest accepted live observation or explicitly
-imported full-catalogue snapshot. Historical states are never inferred from the
-current feed.
+History starts with the earliest trusted full-catalogue snapshot. The service
+never labels current data as historical data and never infers missing history.
 
-## Non-goals
+## Scope
 
-The first version will not store results, participants, attendance, country
-bounds, or raw source documents. It will not expose mutations, an ingestion
-endpoint, authentication, or a separate web application. GraphiQL is enough for
-interactive use.
+The archive stores event metadata only. It does not store results, participants,
+attendance, country bounds, or raw source documents.
 
-The archive records what the source showed when fetched. It does not claim when
-a real-world event change took effect.
+The API is public and read-only. It has no mutations, ingestion endpoint,
+authentication flow, or separate web application. GraphiQL is the interactive
+client.
 
-## Decisions already made
+An observation records what the source showed when it was fetched. It does not
+claim when a real-world change took effect.
 
-- Runtime: Deno, never Node.js.
-- Server: `Deno.serve` with GraphQL Yoga's Fetch API handler.
-- Database: Deno KV.
-- Schedule: daily at 03:00 UTC.
-- Retention: indefinite.
-- Access: public and read-only for now.
-- Canonical event identity: the feed's numeric feature ID.
-- Query key: the slug that was active in the selected historical observation.
-- Date behavior: latest accepted observation on or before the requested date.
-- Batch behavior: up to 100 independent slug/date inputs; preserve input order
-  and duplicates.
-- Changes: chronological appeared, disappeared, and updated transitions, not
-  only a net comparison.
-- Anomalies: a large change must be confirmed by a later valid fetch before
-  publication.
-- Historical loading: only hash-pinned, dated copies of the complete source may
-  be imported, in chronological order, through an offline operator command.
-- Production domain: `parkrun-events.vlcdn.dev`.
+## Core decisions
 
-## Source research
+- Use Deno only: `Deno.serve`, `Deno.cron`, Deno KV, GraphQL Yoga, and
+  GraphQL.js.
+- Fetch the live source daily at 03:00 UTC.
+- Retain accepted history indefinitely.
+- Treat the source numeric ID as event identity.
+- Treat slugs as observation-scoped query keys.
+- Resolve a date to the latest accepted observation on or before that UTC date.
+- Preserve batch input order and duplicates; allow at most 100 inputs.
+- Return every accepted transition in chronological order.
+- Quarantine large changes until a later valid fetch confirms them.
+- Import only dated, hash-pinned copies of the complete source.
+- Use `parkrun-events.vlcdn.dev` as the intended public domain.
 
-The current feed is a GeoJSON `FeatureCollection`. At the time of design it
-contained 2,965 events with numeric IDs from 1 to 3,980. Each event has:
+Historic source research found slug changes attached to stable numeric IDs. It
+found no duplicate active slugs or observed slug reuse across IDs. Ingestion
+still validates both IDs and slugs because this is evidence, not a source
+guarantee.
 
-- `id`
-- `properties.eventname`
-- `EventLongName`
-- `EventShortName`
-- nullable `LocalisedEventLongName`
-- `EventLocation`
-- `countrycode`
-- `seriesid`
-- point coordinates in `[longitude, latitude]` order
+## Public behavior
 
-The top-level country table maps country codes to host names and map bounds.
-Only the host name is needed. The event URL can be derived as
-`https://<country-host>/<slug>/`.
+### Event lookup
 
-A review of 97 distinct Internet Archive snapshots from 2019-10-03 through
-2026-08-23 found:
+`event(slug, asOf)` returns one of three states:
 
-- no duplicate slugs within a snapshot;
-- no observed slug reused by a different numeric ID;
-- 46 numeric IDs that changed slug, such as ID 22 changing from `black-park` to
-  `blackpark`.
+- `FOUND`: an observation and event are present;
+- `NOT_FOUND`: an observation is present but the slug is absent;
+- `NO_ARCHIVE_COVERAGE`: no accepted observation exists on or before the date.
 
-This supports numeric ID as identity and slug as a snapshot-scoped index. It is
-evidence, not an official uniqueness guarantee, so every ingestion still
-validates both IDs and active slugs.
+A future date resolves to the latest accepted observation. A missed, invalid, or
+quarantined day falls back visibly to the preceding accepted observation.
 
-## Runtime shape
+After a rename, the old slug resolves only during its active period. The new
+slug resolves to the same numeric ID from the rename onward.
 
-Keep the code small and separate pure decisions from I/O:
+### Batch lookup
+
+`events(inputs)` accepts 1 through 100 independent slug/date pairs. Results
+preserve input order, length, and duplicates.
+
+The resolver groups repeated dates, revisions, and buckets, batches KV reads in
+groups of at most 10, and restores the original order.
+
+### Change queries
+
+`catalogueChanges` returns non-empty accepted change dates. It supports optional
+UTC date bounds, optional country filtering, and cursor pagination.
+
+`eventChanges` returns the chronological history of one numeric event ID.
+
+A country move appears in both countries: the old country sees the departure and
+the new country sees the arrival. Global results contain the event once.
+
+Outer and inner pages accept 1 through 100 items. Dates sort chronologically;
+events within a date sort by numeric ID.
+
+Cursors are opaque base64url values bound to their connection, filters, country,
+projection, and last sort position. Invalid, oversized, rewound, or cross-scope
+cursors are rejected.
+
+### Dates and errors
+
+Dates must be real UTC calendar dates in `YYYY-MM-DD` form.
+
+Normal historical absence is typed data. Invalid inputs, unavailable storage,
+and corrupt reachable records are GraphQL errors.
+
+## Architecture
+
+The main modules are:
 
 ```text
-src/
-  model.ts             normalized event types and canonical encoding
-  source.ts            fetch and validate events.json
-  diff.ts              ID-based catalogue comparison and anomaly policy
-  archive.ts           storage interface and shared result types
-  kv_archive.ts        Deno KV implementation
-  ingest.ts            ingestion state machine
-  history_manifest.ts  validate dated snapshot manifests and source files
-  history_loader.ts    append snapshots through the ingestion state machine
-  history_cli.ts       validate-only and production loader orchestration
-  graphql.ts           schema, resolvers, dates, cursors, query limits
-  app.ts               HTTP handler composition and /health
-  main.ts              open KV, register cron, start Deno.serve
-scripts/
-  load_historical_snapshots.ts  operator-only loader entrypoint
-tests/
-  fixtures/
-  *_test.ts
-docs/
-  design.md
+src/model.ts             normalized event model and canonical hashing
+src/source.ts            source fetch and full-document validation
+src/diff.ts              ID-based differences and anomaly rules
+src/kv_archive.ts        canonical Deno KV archive
+src/ingest.ts            ingestion state machine
+src/change_views.ts      date, country, detail, and event-history views
+src/change_feed.ts       compressed monthly catalogue feed
+src/history_*.ts         guarded historical import
+src/graphql.ts           schema, resolvers, cursors, and query limits
+src/app.ts               GraphQL, GraphiQL, and health HTTP handling
+src/main.ts              KV setup, cron registration, and server startup
 ```
 
 `main.ts` is the only module that starts processes. Tests call exported
-functions and Yoga's Fetch handler directly.
-
-Direct dependencies will be pinned in `deno.json`:
-
-- `graphql-yoga` 5.x, tested with Deno before selection is finalized;
-- `graphql` 16.x;
-- Deno standard assertion utilities.
-
-Deno-compatible npm packages are package distribution only; the runtime remains
-Deno and the code must not import Node built-ins, Express adapters, `process`,
-or `Buffer`.
-
-## Public GraphQL contract
-
-The intended schema is deliberately small:
-
-```graphql
-scalar Date
-scalar DateTime
-
-type Query {
-  event(slug: String!, asOf: Date!): EventLookup!
-  events(inputs: [EventLookupInput!]!): [EventLookup!]!
-  catalogueChanges(
-    countryCode: Int = null
-    from: Date
-    through: Date
-    first: Int = 20
-    after: String
-  ): CatalogueChangeConnection!
-  eventChanges(
-    eventId: Int!
-    from: Date
-    through: Date
-    first: Int = 20
-    after: String
-  ): EventChangeHistoryConnection!
-  archiveInfo: ArchiveInfo!
-}
-
-input EventLookupInput {
-  slug: String!
-  asOf: Date!
-}
-
-enum EventLookupStatus {
-  FOUND
-  NOT_FOUND
-  NO_ARCHIVE_COVERAGE
-}
-
-type EventLookup {
-  status: EventLookupStatus!
-  requestedSlug: String!
-  requestedDate: Date!
-  observation: Observation
-  event: Event
-}
-
-type Observation {
-  date: Date!
-  fetchedAt: DateTime!
-}
-
-type Event {
-  id: Int!
-  slug: String!
-  name: String!
-  shortName: String!
-  localisedName: String
-  location: String!
-  latitude: Float!
-  longitude: Float!
-  countryCode: Int!
-  countryUrl: String!
-  seriesId: Int!
-  url: String!
-}
-
-type ArchiveInfo {
-  firstObservation: Observation
-  latestObservation: Observation
-  latestEventCount: Int
-}
-
-type CatalogueChangeConnection {
-  nodes: [CatalogueChange!]!
-  pageInfo: PageInfo!
-}
-
-type CatalogueChange {
-  observation: Observation!
-  previousObservation: Observation!
-  counts: ChangeCounts!
-  appeared(first: Int = 50, after: String): EventChangeConnection!
-  disappeared(first: Int = 50, after: String): EventChangeConnection!
-  updated(first: Int = 50, after: String): EventChangeConnection!
-}
-
-type ChangeCounts {
-  appeared: Int!
-  disappeared: Int!
-  updated: Int!
-}
-
-type EventChangeConnection {
-  nodes: [EventChange!]!
-  pageInfo: PageInfo!
-}
-
-type EventChange {
-  id: Int!
-  before: Event
-  after: Event
-  changedFields: [EventField!]!
-}
-
-type EventChangeHistoryConnection {
-  nodes: [EventChangeHistory!]!
-  pageInfo: PageInfo!
-}
-
-type EventChangeHistory {
-  kind: EventChangeKind!
-  observation: Observation!
-  previousObservation: Observation!
-  before: Event
-  after: Event
-  changedFields: [EventField!]!
-  confirmedAnomaly: Boolean!
-}
-
-enum EventChangeKind {
-  APPEARED
-  DISAPPEARED
-  UPDATED
-}
-
-enum EventField {
-  SLUG
-  NAME
-  SHORT_NAME
-  LOCALISED_NAME
-  LOCATION
-  COORDINATES
-  COUNTRY
-  SERIES
-}
-
-type PageInfo {
-  endCursor: String
-  hasNextPage: Boolean!
-}
-```
-
-Expected lookup combinations are:
-
-| Status                | Observation | Event   |
-| --------------------- | ----------- | ------- |
-| `FOUND`               | present     | present |
-| `NOT_FOUND`           | present     | null    |
-| `NO_ARCHIVE_COVERAGE` | null        | null    |
-
-Invalid dates, invalid cursors, oversized batches, and unavailable storage are
-GraphQL errors. Normal historical absence remains typed data rather than an
-error.
-
-The first accepted observation is a baseline and has no change set. An accepted
-observation with no differences is retained, proving the feed was checked that
-day, but it does not appear in `catalogueChanges`.
-
-### Date semantics
-
-`Date` accepts only a real `YYYY-MM-DD` UTC calendar date. For a query date,
-select the latest accepted observation whose observation date is less than or
-equal to it.
-
-A missed, invalid, or quarantined run creates no observation, so lookup
-automatically falls back to the preceding good day. The returned observation
-makes that fallback visible. A future date resolves to the latest accepted
-observation.
-
-After a slug rename, the old slug resolves before the rename and not after it.
-The new slug resolves to the same numeric event ID from the rename onward.
-
-### Batch semantics
-
-`events` accepts between 1 and 100 inputs. Each item can use a different date.
-Results have exactly the same length and order as the input, including duplicate
-inputs.
-
-The resolver groups equal dates and catalogue revisions internally, batches KV
-point reads in groups of at most 10, and restores results by original input
-index.
-
-### Pagination
-
-Outer change-set pages and inner change pages accept 1 through 100 items. Change
-sets sort by observation date; changes within a set sort by numeric event ID.
-
-Cursors are opaque version-1 base64url values containing the connection kind,
-filter fingerprint, and last sort key. A cursor from one date range, country,
-projection, or change kind is invalid for another. Cursor input length is
-bounded before decoding. Internal `read-v2` and `read-v3` names are storage
-schema generations, not public API versions.
-
-## Deno KV model
-
-Deno KV is a good fit for this low-traffic, append-mostly archive, but its
-limits rule out one atomic write for the whole feed:
-
-- maximum encoded key: 2 KiB;
-- maximum value: 64 KiB;
-- `getMany`: 10 keys;
-- atomic checks: 100;
-- atomic mutations: 1,000;
-- atomic total size: 800 KiB.
-
-The design therefore stages immutable, content-addressed data and publishes it
-with one small atomic marker.
-
-### Normalized event versions
-
-Normalize each retained event into a fixed-field object. Canonically encode it
-with an explicit encoding version and hash it with SHA-256.
-
-```text
-["v1", "event", eventHash] -> normalized Event
-```
-
-The hash includes the numeric ID, slug, names, location, coordinates, country
-code and URL, series ID, and encoding version. Unknown source fields, country
-bounds, and raw JSON do not affect it.
-
-### Catalogue buckets
-
-A catalogue revision is a persistent hash-bucket map keyed by slug:
-
-1. Hash the slug.
-2. Use the first hash byte as one of 256 bucket numbers.
-3. Store that bucket as a sorted array of `{ slug, id, eventHash }`.
-4. Hash the canonical bucket value.
-
-```text
-["v1", "bucket", bucketHash] -> sorted bucket entries
-```
-
-A revision manifest stores the 256 bucket hashes in bucket order:
-
-```text
-["v1", "revision", revisionHash] -> {
-  encodingVersion,
-  eventCount,
-  bucketHashes[256]
-}
-```
-
-Unchanged buckets are reused across revisions. A normal event update writes one
-new event version, one new bucket, and one new revision manifest. The manifest
-remains comfortably below 64 KiB; code also enforces a 48 KiB safety ceiling on
-every encoded KV value.
-
-This is simpler than a Merkle tree, much smaller than copying thousands of slug
-keys for every changed day, and faster to query than scanning temporal deltas.
-
-### Observations and control state
-
-```text
-["v1", "observation", "YYYY-MM-DD"] -> {
-  fetchedAt,
-  revisionHash,
-  previousObservationDate,
-  eventCount,
-  sourceEtag
-}
-
-["v1", "change-by-date", "YYYY-MM-DD"] -> changeSetHash
-["v1", "change-set", changeSetHash]     -> counts and page count
-["v1", "change-page", changeSetHash, kind, page] -> change references
-
-["v1", "meta", "head"]    -> latest date and revision
-["v1", "meta", "pending"] -> unconfirmed anomalous candidate
-```
-
-Event, bucket, revision, accepted observation, and accepted change-set records
-are immutable. Head and the pending candidate are coordination state.
-
-Change pages contain compact references to before and after event hashes, not
-duplicated event objects. Pages are sized by encoded bytes and never exceed the
-48 KiB safety ceiling.
-
-No key in accepted history has a TTL.
-
-### Materialized change views
-
-Canonical change sets remain the source of truth. The `read-v2` projection keeps
-complete per-event history and independently rebuildable date and country
-records:
-
-```text
-["read-v2", "catalogue", "all", date]
-["read-v2", "catalogue", "country", countryCode, date]
-["read-v2", "detail", scope, changeSetHash, kind, page]
-["read-v2", "event", eventId, date]
-["read-v2", "meta", "watermark"]
-```
-
-The chronological catalogue query uses a second, query-shaped `read-v3`
-projection. One value normally contains a complete month of summaries and full
-before/after changes:
-
-```text
-["read-v3", "feed", "all", month]
-["read-v3", "feed", "country", countryCode, month]
-["read-v3", "page", scope, month, generationHash, page]
-["read-v3", "meta", "watermark"]
-```
-
-Month payloads use compact versioned tuples and gzip. Their binary envelope
-contains a magic/version marker, bounded decompressed length, and SHA-256 of the
-uncompressed JSON. Inline values target at most 3,500 bytes, below Deno KV's 4
-KiB read-unit boundary. A month that does not fit switches atomically to a small
-generation directory and immutable compressed pages. Mass-change dates split
-into ordered fragments. One incompressible event can occupy a page alone, but
-every stored value stays below 48 KiB and decompression is bounded to 64 KiB per
-page.
-
-Country membership uses the after-country for appearances, the before-country
-for disappearances, and the union of both countries for updates. A move is
-visible under both countries without duplication within either. Omitting or
-passing null for `countryCode` selects the global feed.
-
-Both projections stage data before advancing their own watermark. Readers cap
-results at the watermark, so interruption exposes neither partial months nor
-partial mass changes. Retries verify and reuse staged records. Daily ingestion
-synchronizes `read-v2`, then `read-v3`, after canonical publication. No-change
-observations advance only the watermarks.
-
-The historical `read-v3` projection is built by a temporary validation-first
-backfill command. Its reusable projector stays in production; the one-off script
-and task are removed after production verification.
-
-Against the 42 imported observations, `read-v3` contains 85 records and about 50
-KiB. Its largest value is about 2.6 KiB; every current month is inline. The full
-January-through-August README query uses 11 estimated 4 KiB read units over two
-GraphQL pages, down from 120 with `read-v2` and roughly 200 with the original
-normalized read path.
-
-## Ingestion algorithm
-
-`Deno.cron("fetch-parkrun-events", "0 3 * * *", options, handler)` is registered
-at module top level before `Deno.serve`. Configure bounded retry backoff because
-cron failures are not retried by default.
-
-Each run uses its UTC date as its idempotency key.
-
-### 1. Check the observation date
-
-Read the day's observation, archive head, and pending candidate with strong
-consistency. If that date is already accepted, return successfully.
-
-Deno prevents overlap for one cron definition. The final optimistic commit also
-ensures that concurrent retries cannot publish two observations for one date. A
-date older than the current head or pending anomaly is skipped, so delayed work
-cannot move accepted or quarantined state backwards.
-
-### 2. Fetch safely
-
-Fetch only the configured HTTPS source with:
-
-- an abort timeout;
-- HTTP status validation;
-- a decompressed response-size ceiling;
-- no redirect to an unexpected host;
-- selected response metadata; oversized ETags are discarded.
-
-A network failure does not alter pending candidates or accepted history.
-Throwing lets Deno cron apply its configured retry schedule.
-
-### 3. Validate the complete feed
-
-Reject the whole candidate if any rule fails:
-
-- top-level countries and event `FeatureCollection` exist;
-- between 1,000 and 100,000 events exist;
-- every exposed integer is within GraphQL's signed `Int` range;
-- every ID is unique and positive;
-- every active slug is unique and matches the observed lowercase path-segment
-  form;
-- names and slugs are non-empty and reasonably bounded;
-- location is a bounded string; the source permits an empty location;
-- localized name is either a non-empty string or null;
-- country and series references are valid;
-- geometry is a point with two finite coordinates;
-- longitude is within -180 through 180;
-- latitude is within -90 through 90;
-- every referenced country has a valid host name.
-
-Map GeoJSON `[longitude, latitude]` to named fields. Normalize country hosts to
-HTTPS. Rejecting one malformed record is safer than publishing a partial
-catalogue that resembles mass disappearance.
-
-### 4. Canonicalize and stage
-
-Sort normalized events by numeric ID, calculate event hashes, build 256 sorted
-slug buckets, and calculate the revision hash.
-
-Write missing event versions and buckets idempotently. If a content-addressed
-key already exists, verify its encoded bytes instead of overwriting different
-content. Write the revision manifest only after all referenced data exists.
-
-A crash here can leave unreachable immutable values, but readers cannot see a
-partial revision.
-
-### 5. Diff by numeric ID
-
-Load the prior revision's 256 buckets in `getMany` groups of 10 and reconstruct
-its ID map. Compare it with the candidate:
-
-- ID only in candidate: `appeared`;
-- ID only in previous revision: `disappeared`;
-- ID in both with a different event hash: `updated`;
-- unchanged ID and hash: no change.
-
-A slug rename is one `updated` event. A metadata update counts once regardless
-of how many fields changed. Arrays and pages sort by numeric ID, so source
-ordering cannot create false changes.
-
-### 6. Detect and confirm anomalies
-
-For every non-baseline candidate:
-
-```text
-changed = appeared + disappeared + updated
-anomalous = changed > 100 OR changed / previousEventCount > 0.10
-```
-
-Exactly 100 changes and exactly 10 percent are not anomalous unless the other
-condition is exceeded.
-
-An anomalous candidate is staged and stored as pending without publishing an
-observation. The next successfully fetched and valid candidate confirms it when
-all significant pending transitions persist:
-
-- pending appearances remain present with the same numeric IDs;
-- pending disappearances remain absent;
-- pending updated event versions retain the pending values.
-
-Unrelated small changes are allowed, avoiding permanent quarantine when normal
-catalogue activity continues. A failed or malformed fetch neither confirms nor
-clears the pending candidate.
-
-If the next valid candidate confirms the anomaly, recompute the complete diff
-against the still-published head and publish the confirming candidate. Its
-effective observation date is the confirmation date, not the first quarantined
-date.
-
-If it does not confirm, discard the pending decision and evaluate the new
-candidate normally. It can be published, or become a replacement pending
-anomaly.
-
-### 7. Publish atomically
-
-After all immutable event, bucket, revision, and change-page data exists,
-perform one small atomic operation that:
-
-- checks the previously read head versionstamp;
-- checks that the day's observation is absent;
-- checks the pending-candidate versionstamp;
-- creates the observation marker;
-- creates the change-by-date index when the diff is nonempty;
-- advances the head;
-- clears the pending pointer.
-
-If the optimistic commit loses a race, reread the head and recompute rather than
-blindly retrying stale decisions.
-
-Readers start only from accepted observation keys. Staged or quarantined
-revisions are therefore never visible.
-
-## Historical snapshot loading
-
-The offline loader accepts a local JSON manifest and exact copies of the full
-`events.json` document. It does not scrape, infer, merge, or repair history. A
-manifest has this shape:
-
-```json
-{
-  "formatVersion": 1,
-  "sourceUrl": "https://images.parkrun.com/events.json",
-  "snapshots": [
-    {
-      "date": "2024-01-01",
-      "fetchedAt": "2024-01-01T03:00:00.000Z",
-      "file": "2024-01-01.json",
-      "sha256": "<64 lowercase hexadecimal characters>",
-      "etag": null
-    }
-  ]
-}
-```
-
-Dates must be strictly increasing, timestamps must use canonical UTC
-`YYYY-MM-DDTHH:mm:ss.sssZ` form and fall on their observation date, paths must
-remain under the manifest directory, and every file must match its declared
-SHA-256 digest. The manifest directory must be private to the operator and must
-not be modified while validation or loading is running. Each file goes through
-the same size, schema, ID, slug, coordinate, country, and event-count validation
-as the live source.
-
-`deno task history:load --manifest <path>` is validation-only. It checks every
-file and prints its source digest, revision hash, and event count without
-opening a database. Adding `--apply` requires a production Deno KV connector URL
-and `DENO_KV_ACCESS_TOKEN`; tokens are never accepted as command arguments. The
-command validates the complete set before opening production KV, then re-reads
-and re-verifies each file while applying it. Apply mode emits a start and finish
-record for every snapshot plus a 15-second heartbeat while remote KV work is in
-progress.
-
-Loading is append-only and restartable. An existing observation is skipped only
-when its revision, count, timestamp, and ETag exactly match. The loader refuses
-to insert a missing observation before the current head, so importing older
-history requires an empty database or a new database that can replace the old
-one after verification. Large changes use the same pending-confirmation policy
-as live ingestion. A trailing unconfirmed anomaly remains safely quarantined and
-makes the command exit nonzero. Add a later confirming snapshot and rerun;
-`--accept-pending` changes that final state to a successful exit without
-publishing it.
-
-Disable production ingestion while loading to prevent the daily cron from
-advancing the head past an imported date. Re-enable it only after archive
-queries and the final head have been verified.
-
-## Lookup algorithm
-
-For one slug/date pair:
-
-1. Strictly parse the UTC date.
-2. Try the exact observation key.
-3. If absent, reverse-list accepted observations through the requested date with
-   `limit: 1`.
-4. If none exists, return `NO_ARCHIVE_COVERAGE`.
-5. Load the selected revision manifest.
-6. Hash the slug, select its bucket, and binary-search the sorted entries.
-7. If absent, return `NOT_FOUND` with the effective observation.
-8. Load the referenced event version and return `FOUND`.
-
-Use strong reads for observation roots and all root-reachable data. Validate
-key/date, head, count, revision, change-set, page, and hash relationships before
-returning data. Missing or inconsistent content is archive corruption and
-becomes a service error, never a false `NOT_FOUND`.
-
-For a batch, group requests by date, then revision, then bucket. Deduplicate
-point reads, split every `getMany` into at most 10 keys, bound concurrent list
-operations, and finally restore original positions.
-
-## Failure behavior
-
-| Failure                    | Public result                                     |
-| -------------------------- | ------------------------------------------------- |
-| Source timeout or non-2xx  | Existing history remains available                |
-| Invalid JSON or schema     | Existing history remains available                |
-| Duplicate ID or slug       | Candidate rejected                                |
-| Unconfirmed mass change    | Candidate remains invisible                       |
-| Crash during staging       | Unreachable staged values; no partial observation |
-| Crash after publication    | Retry sees the already accepted date              |
-| Atomic conflict            | Recompute against the new head                    |
-| Missing reachable KV value | Service error; never `NOT_FOUND`                  |
-| Missed day                 | Later as-of queries fall back visibly             |
-
-Structured logs record the run date, outcome, counts, duration, and safe error
-category. Logs never include entire source bodies or stack traces in public
-responses.
-
-## HTTP and query safeguards
-
-- `/graphql` serves GraphQL and GraphiQL.
-- `/health` is unauthenticated and reports process health plus latest accepted
-  observation date.
-- CORS permits public reads.
-- GraphQL request bodies, lexer tokens, and structural depth are bounded.
-- Batch and pagination arguments are bounded to 100.
-- A cardinality-aware validation rule expands fragment spreads and limits
-  expensive aliased lookup and nested pagination fields.
-- Change-set and event-change loads are memoized within each request.
-- One request can run at most eight archive operations concurrently.
+functions and the Fetch handler directly.
+
+Canonical records are authoritative. Change views and the compressed feed are
+derived, independently rebuildable data.
+
+## Canonical storage
+
+Each retained event is normalized to fixed fields and hashed. Catalogue
+revisions reuse content-addressed event records and one of 256 slug buckets when
+their content is unchanged.
+
+An observation points to a complete revision. A change set points to
+byte-bounded pages of appeared, disappeared, and updated event references.
+
+Accepted observations and their reachable content are immutable. Only the
+archive head and a pending anomaly pointer are mutable coordination state.
+
+All values have a 48 KiB safety ceiling. Accepted history has no TTL.
+
+Publication stages immutable content first. One small atomic commit then creates
+the observation, adds its change-date index when needed, advances the head, and
+updates pending state.
+
+Readers begin from accepted observations only. Incomplete staging and
+quarantined candidates are invisible.
+
+## Query storage
+
+The change views store:
+
+- global and country summaries by date;
+- complete byte-bounded detail pages;
+- chronological occurrences by event ID;
+- a publication watermark.
+
+The compressed feed stores one global or country value per active month. A value
+normally contains complete summaries and full before/after event data for that
+month.
+
+Payloads use compact tuples and gzip. The binary envelope contains a magic
+marker, bounded decompressed length, and SHA-256 of the uncompressed JSON.
+
+Inline values target 3,500 bytes, below the 4 KiB read-unit boundary. A larger
+month uses a small directory and immutable compressed pages. Every value stays
+below 48 KiB and each page expands to at most 64 KiB.
+
+Mass-change dates split into ordered fragments. Publication writes all pages
+before switching the month directory. The feed watermark advances only after all
+months are complete.
+
+Retries verify and reuse staged data. Concurrent synchronizers converge through
+compare-and-set publication. Partial work remains hidden behind the watermark.
+
+Daily ingestion publishes the canonical observation, then synchronizes the
+change views and compressed feed. A no-change observation advances only their
+watermarks.
+
+The imported 2026 history produces 84 active monthly scope records using about
+51 KiB. The January-through-August catalogue query needs about 11 estimated 4
+KiB read units across two GraphQL pages.
+
+## Ingestion
+
+### Fetch and validate
+
+Each cron run uses its UTC date as an idempotency key. It skips an already
+accepted date and refuses to move the archive behind a newer head or pending
+candidate.
+
+The fetch has a timeout, response-size ceiling, status check, and redirect-host
+check. Oversized ETags are discarded. A network failure changes no archive
+state.
+
+The complete candidate is rejected when any retained record is invalid.
+Validation covers document shape, event count, integer range, unique positive
+IDs, unique slugs, bounded text, country references, point geometry, and
+coordinate ranges.
+
+Rejecting one malformed event is safer than publishing a partial catalogue that
+resembles mass disappearance.
+
+### Canonicalize and compare
+
+Events sort by numeric ID before hashing. Slug buckets and revision manifests
+are deterministic and independent of source array order.
+
+The candidate is compared with the previous accepted revision by numeric ID:
+
+- only in the candidate: appeared;
+- only in the previous revision: disappeared;
+- in both with different hashes: updated;
+- same ID and hash: unchanged.
+
+A slug rename is one update. Changed fields are recorded for the API.
+
+### Quarantine anomalies
+
+A non-baseline candidate is anomalous when more than 100 events change or more
+than 10 percent of the previous catalogue changes.
+
+An anomalous candidate is staged but not published. A later valid candidate
+confirms it only when all significant transitions persist. Unrelated ordinary
+changes may coexist with confirmation.
+
+A failed or malformed fetch neither confirms nor clears pending state. If the
+next valid candidate does not confirm it, the pending decision is replaced by
+evaluation of that candidate.
+
+A confirmed anomaly is published on the confirmation date after recomputing the
+complete difference from the still-published head.
+
+### Publish
+
+The final atomic commit checks the head, observation absence, and pending
+pointer before publishing. A lost race causes a reread and recomputation, not a
+blind retry.
+
+A crash during staging can leave unreachable immutable values but cannot expose
+a partial observation. A retry after publication recognizes the accepted date.
+
+## Historical imports
+
+The offline loader accepts a local manifest plus exact full-catalogue JSON
+files. Each manifest entry includes its UTC date, fetch timestamp, relative
+path, SHA-256 digest, and optional ETag.
+
+Dates must be strictly increasing. Paths must stay below the manifest directory.
+Every file must match its digest and pass the same source validation as a live
+fetch.
+
+`deno task history:load --manifest <path>` validates every file without opening
+production KV.
+
+Adding `--apply` requires `DENO_KV_URL` and `DENO_KV_ACCESS_TOKEN`. Credentials
+are accepted only through the environment. The loader validates the complete set
+before opening production and rechecks each file while applying.
+
+Loading is append-only, idempotent, and restartable. Existing observations are
+skipped only when all stored metadata matches. Conflicts and attempts to insert
+before the current head are rejected.
+
+The live cron must remain disabled during a historical load. A trailing
+unconfirmed anomaly remains quarantined until a later snapshot confirms it.
+
+## Resource and security limits
+
+- Deno KV point-read batches contain at most 10 keys.
+- Stored values stay below 48 KiB.
+- Compressed feed pages expand to at most 64 KiB.
+- GraphQL bodies, lexer tokens, structural depth, batches, and page sizes are
+  bounded.
+- A cardinality-aware rule limits aliases, fragments, and nested pagination
+  work.
+- One request runs at most eight archive operations concurrently.
+- Repeated reads are memoized within a request.
 - Unexpected errors are masked.
-- There is no mutation or HTTP ingestion route.
+- The service has no mutation or HTTP ingestion route.
 
-Rate limiting and authentication are deferred. They can be added without
-changing archive keys or lookup semantics.
+## Testing and operations
 
-## Testing strategy
+The test suite uses `Deno.test`, pure fixtures, and `Deno.openKv(":memory:")`.
+It does not call the live parkrun source.
 
-Use `Deno.test` with pure fixtures and `Deno.openKv(":memory:")`. The default
-suite never calls the live parkrun feed.
+Coverage includes source rejection, stable hashing, all change kinds, renames,
+anomaly boundaries and confirmation, historical lookup, ordered batches, import
+safety, crash recovery, concurrent publication, cursor scope, compression
+limits, corruption, and read-unit counts.
 
-Required coverage:
+`deno task preflight` runs format checks, linting, type checking, and all tests.
 
-- source parsing and country URL resolution;
-- duplicate and malformed input rejection;
-- coordinate order and range checks;
-- stable canonical hashes despite source property or array order;
-- appeared, disappeared, updated, rename, disappearance, and reappearance;
-- anomaly boundaries at exactly/over 100 and exactly/over 10 percent;
-- confirmation, rejection, failed intervening fetch, and replacement candidate;
-- first observation and unchanged daily observation;
-- as-of fallback before history, on missed days, and on future dates;
-- historical old/new slug behavior;
-- manifest chronology, path containment, hash verification, idempotent snapshot
-  loading, conflict rejection, and anomaly confirmation during import;
-- ordered batches of 1 and 100, independent dates, and duplicates;
-- KV `getMany` chunking;
-- crash injection before revision completion and before atomic publication;
-- idempotent same-day retry and optimistic conflict handling;
-- change-set and nested cursor pagination;
-- GraphQL status/nullability and stable error codes;
-- `/health` and an end-to-end GraphQL request through the Fetch handler.
+Deployment steps are:
 
-One preflight task should run formatting checks, linting, type checking, and all
-tests.
+1. provision and attach Deno KV;
+2. load and verify trusted historical snapshots with ingestion disabled;
+3. build and verify derived change data;
+4. enable ingestion and deploy;
+5. smoke-test `/health`, GraphiQL, archive coverage, filters, history, and
+   pagination;
+6. connect `parkrun-events.vlcdn.dev` after the service is healthy.
 
-## Deployment and operations
-
-1. Provision a Deno KV database in the current Deno Deploy dashboard.
-2. Assign it to the application; `Deno.openKv()` then selects the timeline's
-   database automatically.
-3. Keep production ingestion disabled while loading any historical snapshots.
-4. Run the loader in validation-only mode, review every digest/revision/count,
-   then apply it through the production logical database connector.
-5. Enable production ingestion. Branch timelines also register cron and have
-   isolated databases, so non-production handlers should return immediately
-   unless explicitly enabled.
-6. Deploy and verify `/health`, archive coverage, and a GraphQL introspection
-   request.
-7. Connect `parkrun-events.vlcdn.dev` after the deployment is healthy.
-
-Deno KV stores and transits data through the US. This archive contains public
-event metadata, so no personal-data residency requirement is expected.
-
-Indefinite retention still needs operational protection. Deno's current
-documentation is unclear about managed-KV backup/PITR guarantees and total
-database limits. Before relying on the archive long term, add a periodic export,
-test restoration, and monitor storage growth. Deleting the KV database destroys
-its history.
-
-## Implementation order
-
-1. Create Deno configuration, normalized source types, fixtures, and full-feed
-   validation.
-2. Add deterministic event encoding, bucket revisions, and ID-based diffs.
-3. Implement the Deno KV archive with baseline publication and single as-of
-   lookup.
-4. Add ordered batch lookup and GraphQL integration.
-5. Add change sets, cursor pagination, and anomaly confirmation.
-6. Add cron composition, health reporting, structured logs, and deployment
-   documentation.
-7. Run the full preflight and a local ingestion/query smoke test.
-8. Add the guarded manifest-based historical snapshot loader.
+The archive contains public event metadata. It still needs periodic export,
+restoration tests, and storage monitoring because deleting the KV database
+destroys its history.
 
 ## References
 
 - [Deno Deploy cron](https://docs.deno.com/deploy/reference/cron/)
-- [Deno KV on current Deno Deploy](https://docs.deno.com/deploy/reference/deno_kv/)
+- [Deno KV](https://docs.deno.com/deploy/reference/deno_kv/)
 - [Deno KV transactions and limits](https://docs.deno.com/deploy/kv/transactions/)
-- [Deno KV operations](https://docs.deno.com/deploy/kv/operations/)
 - [GraphQL Yoga with Deno](https://the-guild.dev/graphql/yoga-server/docs/integrations/integration-with-deno)
-- [parkrun events catalogue](https://images.parkrun.com/events.json)
+- [parkrun event catalogue](https://images.parkrun.com/events.json)
