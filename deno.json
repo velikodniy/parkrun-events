@@ -15,6 +15,7 @@
     "dev": "deno run --watch --allow-env --allow-net --allow-read --allow-write src/main.ts",
     "test": "deno test --frozen",
     "build": "deno check --frozen src/main.ts",
+    "history:load": "deno run --allow-read --allow-env=DENO_KV_ACCESS_TOKEN,DENO_KV_URL --allow-net=api.deno.com scripts/load_historical_snapshots.ts",
     "lint": "deno lint",
     "fmt:check": "deno fmt --check",
     "preflight": "deno fmt --check && deno lint && deno check --frozen src/main.ts && deno test --frozen"
