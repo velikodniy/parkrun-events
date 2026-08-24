@@ -270,7 +270,7 @@ Deno.test("packed feed rejects corrupted compressed payloads", async () => {
     await feed.synchronize(views, { apply: true });
     const key: Deno.KvKey = [
       "parkrun-events",
-      "read-v3",
+      "change-feed",
       "feed",
       "all",
       "2026-08",
@@ -309,7 +309,7 @@ Deno.test("packed feed falls back when an inline month compresses above 48 KiB",
 
     const month = await kv.get<unknown>([
       "parkrun-events",
-      "read-v3",
+      "change-feed",
       "feed",
       "all",
       "2026-08",
@@ -344,7 +344,7 @@ Deno.test("packed feed splits incompressible months below one read unit", async 
 
     const month = await kv.get<unknown>([
       "parkrun-events",
-      "read-v3",
+      "change-feed",
       "feed",
       "all",
       "2026-08",
@@ -356,7 +356,7 @@ Deno.test("packed feed splits incompressible months below one read unit", async 
       for (let page = 0; page < directory.p; page += 1) {
         const stored = await kv.get<Uint8Array>([
           "parkrun-events",
-          "read-v3",
+          "change-feed",
           "page",
           "all",
           "2026-08",

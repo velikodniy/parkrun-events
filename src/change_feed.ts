@@ -11,7 +11,7 @@ import { parseUtcDate } from "./date.ts";
 import type { EventField, EventRecord } from "./model.ts";
 import { sha256Hex } from "./model.ts";
 
-const FEED_PREFIX = ["parkrun-events", "read-v3"] as const;
+const FEED_PREFIX = ["parkrun-events", "change-feed"] as const;
 const WATERMARK_KEY = [...FEED_PREFIX, "meta", "watermark"] as const;
 const ENVELOPE_MAGIC = new TextEncoder().encode("PCF1");
 const ENVELOPE_HEADER_BYTES = 40;

@@ -15,7 +15,7 @@ import {
   sha256Hex,
 } from "./model.ts";
 
-const VIEW_PREFIX = ["parkrun-events", "read-v2"] as const;
+const VIEW_PREFIX = ["parkrun-events", "change-views"] as const;
 const WATERMARK_KEY = [...VIEW_PREFIX, "meta", "watermark"] as const;
 const PAGE_TARGET_BYTES = 3_500;
 const MAX_SAFE_VALUE_BYTES = 48 * 1024;

@@ -292,7 +292,7 @@ Deno.test("materialized detail pages target one 4 KiB read unit", async () => {
     let detailPages = 0;
     for await (
       const entry of kv.list<unknown>({
-        prefix: ["parkrun-events", "read-v2", "detail", "all"],
+        prefix: ["parkrun-events", "change-views", "detail", "all"],
       })
     ) {
       detailPages += 1;
