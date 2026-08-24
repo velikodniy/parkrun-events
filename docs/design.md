@@ -350,12 +350,10 @@ keys for every changed day, and faster to query than scanning temporal deltas.
 
 ["v1", "meta", "head"]    -> latest date and revision
 ["v1", "meta", "pending"] -> unconfirmed anomalous candidate
-["v1", "run", "YYYY-MM-DD"] -> attempts and terminal outcome
 ```
 
 Event, bucket, revision, accepted observation, and accepted change-set records
-are immutable. Head, pending candidate, and in-progress run records are
-coordination state.
+are immutable. Head and the pending candidate are coordination state.
 
 Change pages contain compact references to before and after event hashes, not
 duplicated event objects. Pages are sized by encoded bytes and never exceed the
@@ -371,14 +369,15 @@ cron failures are not retried by default.
 
 Each run uses its UTC date as its idempotency key.
 
-### 1. Claim the run
+### 1. Check the observation date
 
-Read the day's run record and the archive head with strong consistency. If the
-date already has a terminal accepted observation, return successfully. Otherwise
-claim or resume the run using an optimistic versionstamp check.
+Read the day's observation, archive head, and pending candidate with strong
+consistency. If that date is already accepted, return successfully.
 
-Deno prevents overlap for one cron definition, but idempotency still protects
-retries, deployments, and crashes.
+Deno prevents overlap for one cron definition. The final optimistic commit also
+ensures that concurrent retries cannot publish two observations for one date. A
+date older than the current head or pending anomaly is skipped, so delayed work
+cannot move accepted or quarantined state backwards.
 
 ### 2. Fetch safely
 
@@ -388,7 +387,7 @@ Fetch only the configured HTTPS source with:
 - HTTP status validation;
 - a decompressed response-size ceiling;
 - no redirect to an unexpected host;
-- selected response metadata such as ETag for logs and observations.
+- selected response metadata; oversized ETags are discarded.
 
 A network failure does not alter pending candidates or accepted history.
 Throwing lets Deno cron apply its configured retry schedule.
@@ -398,12 +397,14 @@ Throwing lets Deno cron apply its configured retry schedule.
 Reject the whole candidate if any rule fails:
 
 - top-level countries and event `FeatureCollection` exist;
-- at least 1,000 events exist for bootstrap safety;
-- every ID is a unique positive integer within GraphQL `Int` range;
+- between 1,000 and 100,000 events exist;
+- every exposed integer is within GraphQL's signed `Int` range;
+- every ID is unique and positive;
 - every active slug is unique and matches the observed lowercase path-segment
   form;
-- all required strings exist and are reasonably bounded;
-- localized name is either string or null;
+- names and slugs are non-empty and reasonably bounded;
+- location is a bounded string; the source permits an empty location;
+- localized name is either a non-empty string or null;
 - country and series references are valid;
 - geometry is a point with two finite coordinates;
 - longitude is within -180 through 180;
@@ -458,7 +459,7 @@ all significant pending transitions persist:
 
 - pending appearances remain present with the same numeric IDs;
 - pending disappearances remain absent;
-- pending updated fields retain the pending values.
+- pending updated event versions retain the pending values.
 
 Unrelated small changes are allowed, avoiding permanent quarantine when normal
 catalogue activity continues. A failed or malformed fetch neither confirms nor
@@ -484,8 +485,7 @@ perform one small atomic operation that:
 - creates the observation marker;
 - creates the change-by-date index when the diff is nonempty;
 - advances the head;
-- updates the run outcome;
-- clears or replaces the pending pointer.
+- clears the pending pointer.
 
 If the optimistic commit loses a race, reread the head and recompute rather than
 blindly retrying stale decisions.
@@ -507,9 +507,10 @@ For one slug/date pair:
 7. If absent, return `NOT_FOUND` with the effective observation.
 8. Load the referenced event version and return `FOUND`.
 
-Use strong reads for observation roots and all root-reachable data. Missing or
-hash-inconsistent content is archive corruption and becomes a service error,
-never a false `NOT_FOUND`.
+Use strong reads for observation roots and all root-reachable data. Validate
+key/date, head, count, revision, change-set, page, and hash relationships before
+returning data. Missing or inconsistent content is archive corruption and
+becomes a service error, never a false `NOT_FOUND`.
 
 For a batch, group requests by date, then revision, then bucket. Deduplicate
 point reads, split every `getMany` into at most 10 keys, bound concurrent list
@@ -529,9 +530,9 @@ operations, and finally restore original positions.
 | Missing reachable KV value | Service error; never `NOT_FOUND`                  |
 | Missed day                 | Later as-of queries fall back visibly             |
 
-Structured logs record the run date, outcome, counts, duration, source status,
-revision hash, and safe error code. Logs never include entire source bodies or
-stack traces in public responses.
+Structured logs record the run date, outcome, counts, duration, and safe error
+category. Logs never include entire source bodies or stack traces in public
+responses.
 
 ## HTTP and query safeguards
 
@@ -539,10 +540,12 @@ stack traces in public responses.
 - `/health` is unauthenticated and reports process health plus latest accepted
   observation date.
 - CORS permits public reads.
-- GraphQL request bodies are bounded.
+- GraphQL request bodies, lexer tokens, and structural depth are bounded.
 - Batch and pagination arguments are bounded to 100.
-- A validation rule bounds aliases/root-field amplification; the schema itself
-  has no recursive object cycles.
+- A cardinality-aware validation rule expands fragment spreads and limits
+  expensive aliased lookup and nested pagination fields.
+- Change-set and event-change loads are memoized within each request.
+- One request can run at most eight archive operations concurrently.
 - Unexpected errors are masked.
 - There is no mutation or HTTP ingestion route.
 
