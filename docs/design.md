@@ -13,8 +13,9 @@ observations in Deno KV. It will answer:
 - What did several slug/date pairs look like in one request?
 - Which events appeared, disappeared, or changed between accepted observations?
 
-History starts with the first successful ingestion. There is no initial
-backfill.
+History starts with the earliest accepted live observation or explicitly
+imported full-catalogue snapshot. Historical states are never inferred from the
+current feed.
 
 ## Non-goals
 
@@ -43,6 +44,8 @@ a real-world event change took effect.
   only a net comparison.
 - Anomalies: a large change must be confirmed by a later valid fetch before
   publication.
+- Historical loading: only hash-pinned, dated copies of the complete source may
+  be imported, in chronological order, through an offline operator command.
 - Production domain: `parkrun-events.vlcdn.dev`.
 
 ## Source research
@@ -88,9 +91,14 @@ src/
   archive.ts           storage interface and shared result types
   kv_archive.ts        Deno KV implementation
   ingest.ts            ingestion state machine
+  history_manifest.ts  validate dated snapshot manifests and source files
+  history_loader.ts    append snapshots through the ingestion state machine
+  history_cli.ts       validate-only and production loader orchestration
   graphql.ts           schema, resolvers, dates, cursors, query limits
   app.ts               HTTP handler composition and /health
   main.ts              open KV, register cron, start Deno.serve
+scripts/
+  load_historical_snapshots.ts  operator-only loader entrypoint
 tests/
   fixtures/
   *_test.ts
@@ -493,6 +501,52 @@ blindly retrying stale decisions.
 Readers start only from accepted observation keys. Staged or quarantined
 revisions are therefore never visible.
 
+## Historical snapshot loading
+
+The offline loader accepts a local JSON manifest and exact copies of the full
+`events.json` document. It does not scrape, infer, merge, or repair history. A
+manifest has this shape:
+
+```json
+{
+  "formatVersion": 1,
+  "sourceUrl": "https://images.parkrun.com/events.json",
+  "snapshots": [
+    {
+      "date": "2024-01-01",
+      "fetchedAt": "2024-01-01T03:00:00.000Z",
+      "file": "2024-01-01.json",
+      "sha256": "<64 lowercase hexadecimal characters>",
+      "etag": null
+    }
+  ]
+}
+```
+
+Dates must be strictly increasing, timestamps must fall on their UTC observation
+date, paths must remain under the manifest directory, and every file must match
+its declared SHA-256 digest. Each file goes through the same size, schema, ID,
+slug, coordinate, country, and event-count validation as the live source.
+
+`deno task history:load --manifest <path>` is validation-only. It checks every
+file and prints its source digest, revision hash, and event count without
+opening a database. Adding `--apply` requires a production Deno KV connector URL
+and `DENO_KV_ACCESS_TOKEN`; tokens are never accepted as command arguments. The
+command validates the complete set before opening production KV, then re-reads
+and re-verifies each file while applying it.
+
+Loading is append-only and restartable. An existing observation is skipped only
+when its revision, count, timestamp, and ETag exactly match. The loader refuses
+to insert a missing observation before the current head, so importing older
+history requires an empty database or a new database that can replace the old
+one after verification. Large changes use the same pending-confirmation policy
+as live ingestion; a trailing unconfirmed anomaly fails the command unless the
+operator explicitly allows it.
+
+Disable production ingestion while loading to prevent the daily cron from
+advancing the head past an imported date. Re-enable it only after archive
+queries and the final head have been verified.
+
 ## Lookup algorithm
 
 For one slug/date pair:
@@ -569,6 +623,8 @@ Required coverage:
 - first observation and unchanged daily observation;
 - as-of fallback before history, on missed days, and on future dates;
 - historical old/new slug behavior;
+- manifest chronology, path containment, hash verification, idempotent snapshot
+  loading, conflict rejection, and anomaly confirmation during import;
 - ordered batches of 1 and 100, independent dates, and duplicates;
 - KV `getMany` chunking;
 - crash injection before revision completion and before atomic publication;
@@ -585,12 +641,15 @@ tests.
 1. Provision a Deno KV database in the current Deno Deploy dashboard.
 2. Assign it to the application; `Deno.openKv()` then selects the timeline's
    database automatically.
-3. Set production ingestion enabled. Branch timelines also register cron and
-   have isolated databases, so non-production handlers should return immediately
+3. Keep production ingestion disabled while loading any historical snapshots.
+4. Run the loader in validation-only mode, review every digest/revision/count,
+   then apply it through the production logical database connector.
+5. Enable production ingestion. Branch timelines also register cron and have
+   isolated databases, so non-production handlers should return immediately
    unless explicitly enabled.
-4. Deploy and verify `/health` and a GraphQL introspection request.
-5. Wait for or observe the first 03:00 UTC baseline ingestion.
-6. Connect `parkrun-events.vlcdn.dev` after the deployment is healthy.
+6. Deploy and verify `/health`, archive coverage, and a GraphQL introspection
+   request.
+7. Connect `parkrun-events.vlcdn.dev` after the deployment is healthy.
 
 Deno KV stores and transits data through the US. This archive contains public
 event metadata, so no personal-data residency requirement is expected.
@@ -613,6 +672,7 @@ its history.
 6. Add cron composition, health reporting, structured logs, and deployment
    documentation.
 7. Run the full preflight and a local ingestion/query smoke test.
+8. Add the guarded manifest-based historical snapshot loader.
 
 ## References
 

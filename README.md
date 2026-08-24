@@ -178,5 +178,6 @@ Dates use `YYYY-MM-DD` in UTC. Failed or rejected catalogue downloads do not
 create empty history; queries automatically fall back to the latest earlier
 successful observation.
 
-History begins with the service's first successful observation. Earlier data is
-not backfilled.
+History begins with the earliest accepted live observation or imported
+full-catalogue snapshot. The archive never infers past states from current data,
+so coverage before that date depends on trustworthy dated snapshots.
