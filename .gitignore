@@ -1,0 +1,6 @@
+.deno-cache/
+coverage/
+data/
+.env
+.env.*
+!.env.example
