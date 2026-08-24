@@ -129,6 +129,39 @@ Deno.test("KvArchive keeps renamed slugs historical and preserves batch order", 
       }),
     );
 
+    const changes = await archive.listCatalogueChanges({
+      from: "2026-08-01",
+      through: "2026-08-31",
+      first: 10,
+    });
+    assertEquals(changes.nodes, [{
+      hash: changeSetHash,
+      observation: {
+        date: "2026-08-02",
+        fetchedAt: "2026-08-02T03:00:00.000Z",
+      },
+      previousObservation: {
+        date: "2026-08-01",
+        fetchedAt: "2026-08-01T03:00:00.000Z",
+      },
+      counts: { appeared: 0, disappeared: 0, updated: 1 },
+      confirmedAnomaly: false,
+    }]);
+    assertEquals(changes.hasNextPage, false);
+    assertEquals(
+      await archive.getEventChanges(changeSetHash, "updated", { first: 10 }),
+      {
+        nodes: [{
+          id: 1,
+          before: event(1, "old-slug"),
+          after: event(1, "new-slug"),
+          changedFields: ["SLUG", "NAME", "SHORT_NAME", "LOCATION"],
+        }],
+        endId: 1,
+        hasNextPage: false,
+      },
+    );
+
     const results = await archive.lookupMany([
       { slug: "new-slug", asOf: "2026-08-02" },
       { slug: "old-slug", asOf: "2026-08-01" },

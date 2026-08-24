@@ -93,3 +93,30 @@ export interface ArchiveInfo {
   readonly latestObservation: PublicObservation | null;
   readonly latestEventCount: number | null;
 }
+
+export interface CatalogueChangeSummary {
+  readonly hash: string;
+  readonly observation: PublicObservation;
+  readonly previousObservation: PublicObservation;
+  readonly counts: Readonly<Record<ChangeKind, number>>;
+  readonly confirmedAnomaly: boolean;
+}
+
+export interface CatalogueChangePage {
+  readonly nodes: readonly CatalogueChangeSummary[];
+  readonly endDate: UtcDate | null;
+  readonly hasNextPage: boolean;
+}
+
+export interface EventChangeNode {
+  readonly id: number;
+  readonly before: EventRecord | null;
+  readonly after: EventRecord | null;
+  readonly changedFields: readonly EventField[];
+}
+
+export interface EventChangePage {
+  readonly nodes: readonly EventChangeNode[];
+  readonly endId: number | null;
+  readonly hasNextPage: boolean;
+}

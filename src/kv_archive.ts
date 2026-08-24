@@ -2,9 +2,11 @@ import type {
   ArchiveControl,
   ArchiveHead,
   ArchiveInfo,
+  CatalogueChangePage,
   ChangeKind,
   ChangeReference,
   ChangeSetManifest,
+  EventChangePage,
   EventLookupInput,
   EventLookupResult,
   ObservationRecord,
@@ -44,6 +46,7 @@ const PENDING_KEY = [...PREFIX, "meta", "pending"] as const;
 const MAX_BATCH_KEYS = 10;
 const MAX_ATOMIC_CHECKS = 100;
 const MAX_SAFE_VALUE_BYTES = 48 * 1024;
+const MAX_ATOMIC_STAGE_BYTES = 500 * 1024;
 const CHANGE_PAGE_ITEMS = 50;
 
 interface ImmutableItem<T> {
@@ -472,6 +475,172 @@ export class KvArchive {
     });
   }
 
+  async listCatalogueChanges(options: {
+    readonly from?: string;
+    readonly through?: string;
+    readonly first: number;
+    readonly afterDate?: string;
+  }): Promise<CatalogueChangePage> {
+    if (options.first < 1 || options.first > 100) {
+      throw new RangeError("Change-set page size must be between 1 and 100");
+    }
+    const from = options.from === undefined ? null : parseUtcDate(options.from);
+    const through = options.through === undefined
+      ? null
+      : parseUtcDate(options.through);
+    const afterDate = options.afterDate === undefined
+      ? null
+      : parseUtcDate(options.afterDate);
+    if (from !== null && through !== null && from > through) {
+      throw new RangeError(
+        "Change-set start date must not follow its end date",
+      );
+    }
+
+    const startDate = afterDate === null
+      ? from
+      : from === null || afterDate >= from
+      ? `${afterDate}\u0000`
+      : from;
+    const endDate = through === null ? null : nextUtcDate(through);
+    const selector: Deno.KvListSelector = startDate !== null && endDate !== null
+      ? { start: changeDateKey(startDate), end: changeDateKey(endDate) }
+      : startDate !== null
+      ? { prefix: CHANGE_DATE_PREFIX, start: changeDateKey(startDate) }
+      : endDate !== null
+      ? { prefix: CHANGE_DATE_PREFIX, end: changeDateKey(endDate) }
+      : { prefix: CHANGE_DATE_PREFIX };
+    const rows: { date: string; hash: string }[] = [];
+    const iterator = this.kv.list<string>(selector, {
+      limit: options.first + 1,
+      consistency: "strong",
+    });
+    for await (const entry of iterator) {
+      const date = entry.key.at(-1);
+      if (typeof date !== "string") {
+        throw new ArchiveCorruptError("Change index has an invalid date key");
+      }
+      rows.push({ date, hash: entry.value });
+    }
+
+    const hasNextPage = rows.length > options.first;
+    const pageRows = rows.slice(0, options.first);
+    const nodes = await Promise.all(pageRows.map(async ({ date, hash }) => {
+      const observationEntry = await this.kv.get<ObservationRecord>(
+        observationKey(date),
+        { consistency: "strong" },
+      );
+      const observation = observationEntry.value;
+      if (
+        observation === null || observation.previousObservationDate === null
+      ) {
+        throw new ArchiveCorruptError(
+          "Change index points to an invalid observation",
+        );
+      }
+      const previousEntry = await this.kv.get<ObservationRecord>(
+        observationKey(observation.previousObservationDate),
+        { consistency: "strong" },
+      );
+      const previous = previousEntry.value;
+      if (previous === null) {
+        throw new ArchiveCorruptError(
+          "Change observation has no previous observation",
+        );
+      }
+      const manifestEntry = await this.kv.get<ChangeSetManifest>(
+        changeSetKey(hash),
+        { consistency: "strong" },
+      );
+      if (manifestEntry.value === null) {
+        throw new ArchiveCorruptError(
+          "Change index points to a missing change set",
+        );
+      }
+      return {
+        hash,
+        observation: toPublicObservation(observation),
+        previousObservation: toPublicObservation(previous),
+        counts: manifestEntry.value.counts,
+        confirmedAnomaly: observation.confirmedAnomaly,
+      };
+    }));
+
+    return {
+      nodes,
+      endDate: nodes.at(-1)?.observation.date ?? null,
+      hasNextPage,
+    };
+  }
+
+  async getEventChanges(
+    changeSetHash: string,
+    kind: ChangeKind,
+    options: { readonly first: number; readonly afterId?: number },
+  ): Promise<EventChangePage> {
+    if (options.first < 1 || options.first > 100) {
+      throw new RangeError("Event-change page size must be between 1 and 100");
+    }
+    const stored = await this.loadChangeSet(changeSetHash);
+    const references = referencesFromDiff(stored.diff)[kind];
+    const start = options.afterId === undefined
+      ? 0
+      : references.findIndex((entry) => entry.id > options.afterId!);
+    if (start === -1) {
+      return { nodes: [], endId: null, hasNextPage: false };
+    }
+    const selected = references.slice(start, start + options.first + 1);
+    const hasNextPage = selected.length > options.first;
+    const pageReferences = selected.slice(0, options.first);
+    const hashes = [
+      ...new Set(pageReferences.flatMap((entry) => [
+        ...(entry.beforeHash === null ? [] : [entry.beforeHash]),
+        ...(entry.afterHash === null ? [] : [entry.afterHash]),
+      ])),
+    ];
+    const eventEntries = await this.getMany<EventRecord>(hashes.map(eventKey));
+    const events = new Map<string, EventRecord>();
+    for (let index = 0; index < hashes.length; index += 1) {
+      const hash = hashes[index]!;
+      const event = eventEntries[index]!.value;
+      if (event === null) {
+        throw new ArchiveCorruptError(
+          `Change references missing event ${hash}`,
+        );
+      }
+      await verifyHash(hash, canonicalEventJson(event), "event");
+      events.set(hash, event);
+    }
+
+    const nodes = pageReferences.map((reference) => {
+      const before = reference.beforeHash === null
+        ? null
+        : events.get(reference.beforeHash) ?? null;
+      const after = reference.afterHash === null
+        ? null
+        : events.get(reference.afterHash) ?? null;
+      if (
+        (reference.beforeHash !== null && before === null) ||
+        (reference.afterHash !== null && after === null) ||
+        (before !== null && before.id !== reference.id) ||
+        (after !== null && after.id !== reference.id)
+      ) {
+        throw new ArchiveCorruptError("Change event identity is inconsistent");
+      }
+      return {
+        id: reference.id,
+        before,
+        after,
+        changedFields: reference.changedFields,
+      };
+    });
+    return {
+      nodes,
+      endId: nodes.at(-1)?.id ?? null,
+      hasNextPage,
+    };
+  }
+
   async getArchiveInfo(): Promise<ArchiveInfo> {
     const head = await this.kv.get<ArchiveHead>(HEAD_KEY, {
       consistency: "strong",
@@ -564,7 +733,7 @@ export class KvArchive {
       uniqueItems.set(keyString, item);
     }
 
-    for (const items of chunk([...uniqueItems.values()], MAX_ATOMIC_CHECKS)) {
+    for (const items of chunkImmutableItems([...uniqueItems.values()])) {
       await this.putImmutableChunk(items, 0);
     }
   }
@@ -752,4 +921,29 @@ function chunk<T>(values: readonly T[], size: number): T[][] {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+function chunkImmutableItems<T>(
+  items: readonly ImmutableItem<T>[],
+): ImmutableItem<T>[][] {
+  const groups: ImmutableItem<T>[][] = [];
+  let group: ImmutableItem<T>[] = [];
+  let groupBytes = 0;
+  for (const item of items) {
+    const itemBytes = new TextEncoder().encode(item.encoded).byteLength +
+      new TextEncoder().encode(JSON.stringify(item.key)).byteLength;
+    if (
+      group.length > 0 &&
+      (group.length >= MAX_ATOMIC_CHECKS ||
+        groupBytes + itemBytes > MAX_ATOMIC_STAGE_BYTES)
+    ) {
+      groups.push(group);
+      group = [];
+      groupBytes = 0;
+    }
+    group.push(item);
+    groupBytes += itemBytes;
+  }
+  if (group.length > 0) groups.push(group);
+  return groups;
 }
