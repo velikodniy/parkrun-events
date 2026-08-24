@@ -15,7 +15,23 @@ export type HistoricalSnapshotReader = (
 
 export interface HistoricalSnapshotLoadOptions {
   readonly today?: string;
+  readonly onProgress?: (progress: HistoricalSnapshotLoadProgress) => void;
 }
+
+export type HistoricalSnapshotLoadProgress =
+  | {
+    readonly phase: "SNAPSHOT_STARTED";
+    readonly index: number;
+    readonly total: number;
+    readonly date: string;
+  }
+  | {
+    readonly phase: "SNAPSHOT_FINISHED";
+    readonly index: number;
+    readonly total: number;
+    readonly date: string;
+    readonly outcome: IngestionOutcome;
+  };
 
 export interface HistoricalSnapshotLoadRow {
   readonly date: string;
@@ -52,7 +68,14 @@ export class HistoricalSnapshotLoader {
     validateEntryOrder(entries, today);
 
     const rows: HistoricalSnapshotLoadRow[] = [];
-    for (const entry of entries) {
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index]!;
+      options.onProgress?.({
+        phase: "SNAPSHOT_STARTED",
+        index,
+        total: entries.length,
+        date: entry.date,
+      });
       const snapshot = await readSnapshot(entry);
       assertSnapshotMatchesEntry(snapshot, entry);
       const candidate = await buildRevision(snapshot.events);
@@ -60,14 +83,22 @@ export class HistoricalSnapshotLoader {
       const existing = control.observation.value;
       if (existing !== null) {
         assertObservationMatchesSnapshot(existing, candidate, snapshot);
+        const outcome: IngestionOutcome = {
+          status: "ALREADY_ACCEPTED",
+          date: entry.date,
+          eventCount: existing.eventCount,
+        };
         rows.push({
           date: entry.date,
           sourceSha256: snapshot.sourceSha256,
-          outcome: {
-            status: "ALREADY_ACCEPTED",
-            date: entry.date,
-            eventCount: existing.eventCount,
-          },
+          outcome,
+        });
+        options.onProgress?.({
+          phase: "SNAPSHOT_FINISHED",
+          index,
+          total: entries.length,
+          date: entry.date,
+          outcome,
         });
         continue;
       }
@@ -87,6 +118,13 @@ export class HistoricalSnapshotLoader {
       rows.push({
         date: entry.date,
         sourceSha256: snapshot.sourceSha256,
+        outcome,
+      });
+      options.onProgress?.({
+        phase: "SNAPSHOT_FINISHED",
+        index,
+        total: entries.length,
+        date: entry.date,
         outcome,
       });
     }

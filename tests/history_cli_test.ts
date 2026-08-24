@@ -113,6 +113,7 @@ Deno.test("historical loader CLI rejects unsafe or secret-bearing arguments", ()
 Deno.test("historical loader validates every file before applying", async () => {
   const manifest = snapshotManifest(["2026-08-01", "2026-08-02"]);
   const order: string[] = [];
+  const logs: string[] = [];
   const arguments_ = parseHistoricalLoaderArgs([
     "--manifest",
     "manifest.json",
@@ -130,12 +131,35 @@ Deno.test("historical loader validates every file before applying", async () => 
       order.push(`validate:${entry.date}`);
       return Promise.resolve(historicalSnapshot(entry));
     },
-    applySnapshots: async (_url, entries, readSnapshot) => {
+    applySnapshots: async (_url, entries, readSnapshot, _today, onProgress) => {
       order.push("apply");
-      for (const entry of entries) await readSnapshot(entry);
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index]!;
+        onProgress({
+          phase: "SNAPSHOT_STARTED",
+          index,
+          total: entries.length,
+          date: entry.date,
+        });
+        await readSnapshot(entry);
+        onProgress({
+          phase: "SNAPSHOT_FINISHED",
+          index,
+          total: entries.length,
+          date: entry.date,
+          outcome: {
+            status: "ACCEPTED",
+            date: entry.date,
+            eventCount: 1,
+            changeCount: 0,
+            confirmedAnomaly: false,
+          },
+        });
+      }
       return { rows: [], pendingDate: null };
     },
-    writeLine: () => {},
+    writeLine: (line) => logs.push(line),
+    heartbeatIntervalMs: 0,
   });
 
   assertEquals(order, [
@@ -145,6 +169,18 @@ Deno.test("historical loader validates every file before applying", async () => 
     "validate:2026-08-01",
     "validate:2026-08-02",
   ]);
+  assertEquals(
+    logs.map((line) => (JSON.parse(line) as { event: string }).event).filter((
+      event,
+    ) => event.includes("apply") || event === "historical_load_started"),
+    [
+      "historical_load_started",
+      "snapshot_apply_started",
+      "snapshot_apply_finished",
+      "snapshot_apply_started",
+      "snapshot_apply_finished",
+    ],
+  );
 });
 
 Deno.test("historical loader never opens production after validation fails", async () => {
@@ -217,6 +253,7 @@ Deno.test("production snapshot apply closes its KV connection", async () => {
     [entry],
     () => Promise.resolve(historicalSnapshot(entry)),
     "2026-08-02",
+    () => {},
     () => Promise.resolve(kv),
   );
   assertEquals(report.rows[0]?.outcome.status, "ACCEPTED");

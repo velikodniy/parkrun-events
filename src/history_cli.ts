@@ -9,6 +9,7 @@ import {
 import {
   HistoricalSnapshotConflictError,
   HistoricalSnapshotLoader,
+  type HistoricalSnapshotLoadProgress,
   type HistoricalSnapshotLoadReport,
 } from "./history_loader.ts";
 import { KvArchive } from "./kv_archive.ts";
@@ -26,6 +27,7 @@ export interface HistoricalLoaderRunOptions {
   readonly today?: string;
   readonly env?: (name: string) => string | undefined;
   readonly writeLine?: (line: string) => void;
+  readonly heartbeatIntervalMs?: number;
   readonly readManifest?: (
     path: string,
   ) => Promise<HistoricalSnapshotManifest>;
@@ -40,6 +42,7 @@ export interface HistoricalLoaderRunOptions {
       entry: HistoricalSnapshotManifestEntry,
     ) => Promise<HistoricalSnapshot>,
     today: string,
+    onProgress: (progress: HistoricalSnapshotLoadProgress) => void,
   ) => Promise<HistoricalSnapshotLoadReport>;
 }
 
@@ -171,18 +174,48 @@ export async function runHistoricalLoader(
   );
   const applySnapshots = options.applySnapshots ??
     applyHistoricalSnapshotsToDatabase;
-  const report = await applySnapshots(
-    databaseUrl,
-    manifest.snapshots,
-    (entry) => readSnapshot(manifestPath, entry),
-    today,
-  );
-  for (const row of report.rows) {
-    writeLine(JSON.stringify({
-      event: "snapshot_load_finished",
-      sourceSha256: row.sourceSha256,
-      ...row.outcome,
-    }));
+  const startedAt = performance.now();
+  let activeDate: string | null = null;
+  writeLine(JSON.stringify({
+    event: "historical_load_started",
+    snapshotCount: manifest.snapshots.length,
+  }));
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000;
+  const heartbeat = heartbeatIntervalMs > 0
+    ? setInterval(() => {
+      writeLine(JSON.stringify({
+        event: "historical_load_active",
+        activeDate,
+        elapsedSeconds: Math.round((performance.now() - startedAt) / 1_000),
+      }));
+    }, heartbeatIntervalMs)
+    : null;
+  let report: HistoricalSnapshotLoadReport;
+  try {
+    report = await applySnapshots(
+      databaseUrl,
+      manifest.snapshots,
+      (entry) => readSnapshot(manifestPath, entry),
+      today,
+      (progress) => {
+        activeDate = progress.phase === "SNAPSHOT_STARTED"
+          ? progress.date
+          : null;
+        writeLine(JSON.stringify({
+          event: progress.phase === "SNAPSHOT_STARTED"
+            ? "snapshot_apply_started"
+            : "snapshot_apply_finished",
+          position: progress.index + 1,
+          total: progress.total,
+          date: progress.date,
+          ...(progress.phase === "SNAPSHOT_FINISHED"
+            ? { outcome: progress.outcome }
+            : {}),
+        }));
+      },
+    );
+  } finally {
+    if (heartbeat !== null) clearInterval(heartbeat);
   }
   if (report.pendingDate !== null && !arguments_.acceptPending) {
     throw new HistoricalSnapshotConflictError(
@@ -204,12 +237,13 @@ export async function applyHistoricalSnapshotsToDatabase(
     entry: HistoricalSnapshotManifestEntry,
   ) => Promise<HistoricalSnapshot>,
   today: string,
+  onProgress: (progress: HistoricalSnapshotLoadProgress) => void = () => {},
   openKv: (url: string) => Promise<Deno.Kv> = Deno.openKv,
 ): Promise<HistoricalSnapshotLoadReport> {
   const kv = await openKv(databaseUrl);
   try {
     const loader = new HistoricalSnapshotLoader(new KvArchive(kv));
-    return await loader.load(entries, readSnapshot, { today });
+    return await loader.load(entries, readSnapshot, { today, onProgress });
   } finally {
     kv.close();
   }

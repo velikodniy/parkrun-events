@@ -536,7 +536,9 @@ file and prints its source digest, revision hash, and event count without
 opening a database. Adding `--apply` requires a production Deno KV connector URL
 and `DENO_KV_ACCESS_TOKEN`; tokens are never accepted as command arguments. The
 command validates the complete set before opening production KV, then re-reads
-and re-verifies each file while applying it.
+and re-verifies each file while applying it. Apply mode emits a start and finish
+record for every snapshot plus a 15-second heartbeat while remote KV work is in
+progress.
 
 Loading is append-only and restartable. An existing observation is skipped only
 when its revision, count, timestamp, and ETag exactly match. The loader refuses

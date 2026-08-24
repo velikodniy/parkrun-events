@@ -55,15 +55,25 @@ Deno.test("historical loader publishes chronological snapshots idempotently", as
     ]);
     const entries = [...snapshots.values()].map((value) => entry(value.date));
     const loader = new HistoricalSnapshotLoader(archive);
+    const progress: string[] = [];
     const read = (metadata: HistoricalSnapshotManifestEntry) =>
       Promise.resolve(snapshots.get(metadata.date)!);
 
-    const first = await loader.load(entries, read, { today: "2026-08-03" });
+    const first = await loader.load(entries, read, {
+      today: "2026-08-03",
+      onProgress: (event) => progress.push(`${event.phase}:${event.date}`),
+    });
     assertEquals(first.rows.map((row) => row.outcome.status), [
       "ACCEPTED",
       "ACCEPTED",
     ]);
     assertEquals(first.pendingDate, null);
+    assertEquals(progress, [
+      "SNAPSHOT_STARTED:2026-08-01",
+      "SNAPSHOT_FINISHED:2026-08-01",
+      "SNAPSHOT_STARTED:2026-08-02",
+      "SNAPSHOT_FINISHED:2026-08-02",
+    ]);
 
     const lookups = await archive.lookupMany([
       { slug: "event-1", asOf: "2026-08-01" },
