@@ -35,6 +35,19 @@ Deno.test("parseEventsDocument normalizes retained event metadata", () => {
   }]);
 });
 
+Deno.test("parseEventsDocument accepts an empty source location", () => {
+  const document = eventsDocument([
+    eventFeature(1, "alpha", {
+      properties: { EventLocation: "" },
+    }),
+  ]);
+
+  assertEquals(
+    parseEventsDocument(document, { minimumEventCount: 1 })[0]!.location,
+    "",
+  );
+});
+
 Deno.test("parseEventsDocument rejects duplicate IDs", () => {
   const document = eventsDocument([
     eventFeature(1, "alpha"),

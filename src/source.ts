@@ -343,6 +343,7 @@ function parseFeature(
       properties.EventLocation,
       `${path}.properties.EventLocation`,
       "INVALID_EVENT",
+      true,
     ),
     longitude: normalizeNegativeZero(coordinates[0]),
     latitude: normalizeNegativeZero(coordinates[1]),
@@ -383,12 +384,19 @@ function expectString(
   value: unknown,
   path: string,
   code: SourceErrorCode,
+  allowEmpty = false,
 ): string {
   if (
-    typeof value !== "string" || value.length === 0 ||
+    typeof value !== "string" || (!allowEmpty && value.length === 0) ||
     value.length > MAX_SOURCE_STRING_LENGTH
   ) {
-    throw dataError(code, path, "Expected a bounded, non-empty string");
+    throw dataError(
+      code,
+      path,
+      allowEmpty
+        ? "Expected a bounded string"
+        : "Expected a bounded, non-empty string",
+    );
   }
   return value;
 }
