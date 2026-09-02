@@ -47,7 +47,13 @@ const typeDefs = /* GraphQL */ `
   scalar DateTime
 
   type Query {
-    event(slug: String!, asOf: Date!): EventLookup!
+    countries(asOf: Date): [CountryInfo!]!
+    event(
+      id: Int
+      slug: String
+      asOf: Date!
+      fallbackToEarliest: Boolean = true
+    ): EventLookup!
     events(inputs: [EventLookupInput!]!): [EventLookup!]!
     catalogueChanges(
       countryCode: Int = null
@@ -67,8 +73,10 @@ const typeDefs = /* GraphQL */ `
   }
 
   input EventLookupInput {
-    slug: String!
+    id: Int
+    slug: String
     asOf: Date!
+    fallbackToEarliest: Boolean = true
   }
 
   enum EventLookupStatus {
@@ -79,10 +87,17 @@ const typeDefs = /* GraphQL */ `
 
   type EventLookup {
     status: EventLookupStatus!
-    requestedSlug: String!
+    requestedId: Int
+    requestedSlug: String
     requestedDate: Date!
     observation: Observation
     event: Event
+  }
+
+  type CountryInfo {
+    code: Int!
+    url: String!
+    eventCount: Int!
   }
 
   type Observation {
@@ -109,6 +124,7 @@ const typeDefs = /* GraphQL */ `
     firstObservation: Observation
     latestObservation: Observation
     latestEventCount: Int
+    latestCountryCodes: [Int!]!
   }
 
   type CatalogueChangeConnection {
@@ -387,22 +403,27 @@ export function createGraphqlServer(
       Date: dateScalar,
       DateTime: dateTimeScalar,
       Query: {
+        countries: (
+          _parent: unknown,
+          arguments_: { readonly asOf?: string | null },
+          context: GraphqlContext,
+        ) =>
+          context.archiveSemaphore.run(() =>
+            archive.getCountries(arguments_.asOf ?? undefined)
+          ),
         event: async (
           _parent: unknown,
-          arguments_: { readonly slug: string; readonly asOf: string },
+          arguments_: RawEventLookupInput,
           context: GraphqlContext,
         ) => {
-          const input = normalizeLookupInput({
-            slug: arguments_.slug,
-            asOf: arguments_.asOf,
-          });
+          const input = normalizeLookupInput(arguments_);
           return await context.archiveSemaphore.run(async () =>
             (await archive.lookupMany([input]))[0]!
           );
         },
         events: async (
           _parent: unknown,
-          arguments_: { readonly inputs: readonly EventLookupInput[] },
+          arguments_: { readonly inputs: readonly RawEventLookupInput[] },
           context: GraphqlContext,
         ) => {
           if (arguments_.inputs.length < 1 || arguments_.inputs.length > 100) {
@@ -784,14 +805,46 @@ function fieldCardinality(field: FieldNode): number {
   return Math.min(Math.max(Number(first.value), 1), 100);
 }
 
-function normalizeLookupInput(input: EventLookupInput): EventLookupInput {
-  const slug = input.slug.trim().toLowerCase();
-  if (!QUERY_SLUG_PATTERN.test(slug) || slug.length > 128) {
-    throw new GraphQLError("Invalid event slug", {
-      extensions: { code: "BAD_USER_INPUT", field: "slug" },
+interface RawEventLookupInput {
+  readonly id?: number | null;
+  readonly slug?: string | null;
+  readonly asOf: string;
+  readonly fallbackToEarliest?: boolean | null;
+}
+
+function normalizeLookupInput(input: RawEventLookupInput): EventLookupInput {
+  const hasId = input.id !== undefined && input.id !== null;
+  const hasSlug = input.slug !== undefined && input.slug !== null;
+  if (!hasId && !hasSlug) {
+    throw new GraphQLError("Either event id or slug must be provided", {
+      extensions: { code: "BAD_USER_INPUT" },
     });
   }
-  return { slug, asOf: parseUtcDate(input.asOf) };
+  if (hasId) {
+    if (
+      !Number.isSafeInteger(input.id) || (input.id as number) <= 0 ||
+      (input.id as number) > 2_147_483_647
+    ) {
+      throw new GraphQLError("Event ID must be a positive integer", {
+        extensions: { code: "BAD_USER_INPUT", field: "id" },
+      });
+    }
+  }
+  let slug: string | undefined;
+  if (hasSlug) {
+    slug = input.slug!.trim().toLowerCase();
+    if (!QUERY_SLUG_PATTERN.test(slug) || slug.length > 128) {
+      throw new GraphQLError("Invalid event slug", {
+        extensions: { code: "BAD_USER_INPUT", field: "slug" },
+      });
+    }
+  }
+  return {
+    id: hasId ? (input.id as number) : undefined,
+    slug,
+    asOf: parseUtcDate(input.asOf),
+    fallbackToEarliest: input.fallbackToEarliest ?? true,
+  };
 }
 
 function coerceDate(value: unknown): string {

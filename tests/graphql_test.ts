@@ -133,7 +133,11 @@ Deno.test("GraphQL resolves single and ordered historical event lookups", async 
             { slug: "new-slug", asOf: "2026-08-02" },
             { slug: "old-slug", asOf: "2026-08-01" },
             { slug: "old-slug", asOf: "2026-08-02" },
-            { slug: "old-slug", asOf: "2026-07-31" },
+            {
+              slug: "old-slug",
+              asOf: "2026-07-31",
+              fallbackToEarliest: false,
+            },
             { slug: "new-slug", asOf: "9999-12-31" },
           ],
         },
@@ -756,6 +760,360 @@ Deno.test("GraphQL rejects invalid dates and oversized batches", async () => {
       (fragmentErrors[0]!.extensions as Record<string, unknown>).code,
       "QUERY_TOO_COMPLEX",
     );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GraphQL supports lookup by event id, mixed batches, and pre-archive fallback", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    await publish(
+      archive,
+      [event(1, "bushy", 97), event(2, "albert", 3)],
+      "2026-01-06",
+    );
+    await publish(
+      archive,
+      [event(1, "bushy-park", 97), event(3, "delta", 14)],
+      "2026-01-07",
+    );
+    const server = createGraphqlServer(archive);
+
+    const singleDay1 = await execute(
+      server,
+      `query {
+        event(id: 1, asOf: "2026-01-06") {
+          status
+          requestedId
+          requestedSlug
+          requestedDate
+          observation { date }
+          event { id slug }
+        }
+      }`,
+    );
+    assertEquals(singleDay1, {
+      data: {
+        event: {
+          status: "FOUND",
+          requestedId: 1,
+          requestedSlug: null,
+          requestedDate: "2026-01-06",
+          observation: { date: "2026-01-06" },
+          event: { id: 1, slug: "bushy" },
+        },
+      },
+    });
+
+    const singleDay2 = await execute(
+      server,
+      `query {
+        event(id: 1, asOf: "2026-01-07") {
+          status
+          requestedId
+          requestedSlug
+          requestedDate
+          observation { date }
+          event { id slug }
+        }
+      }`,
+    );
+    assertEquals(singleDay2, {
+      data: {
+        event: {
+          status: "FOUND",
+          requestedId: 1,
+          requestedSlug: null,
+          requestedDate: "2026-01-07",
+          observation: { date: "2026-01-07" },
+          event: { id: 1, slug: "bushy-park" },
+        },
+      },
+    });
+
+    const disappeared = await execute(
+      server,
+      `query {
+        event(id: 2, asOf: "2026-01-07") {
+          status
+          requestedId
+          requestedSlug
+          requestedDate
+          event { id }
+        }
+      }`,
+    );
+    assertEquals(disappeared, {
+      data: {
+        event: {
+          status: "NOT_FOUND",
+          requestedId: 2,
+          requestedSlug: null,
+          requestedDate: "2026-01-07",
+          event: null,
+        },
+      },
+    });
+
+    const fallbackDefault = await execute(
+      server,
+      `query {
+        event(id: 1, asOf: "2020-01-01") {
+          status
+          requestedId
+          requestedDate
+          observation { date }
+          event { id slug }
+        }
+      }`,
+    );
+    assertEquals(fallbackDefault, {
+      data: {
+        event: {
+          status: "FOUND",
+          requestedId: 1,
+          requestedDate: "2020-01-01",
+          observation: { date: "2026-01-06" },
+          event: { id: 1, slug: "bushy" },
+        },
+      },
+    });
+
+    const fallbackDisabled = await execute(
+      server,
+      `query {
+        event(id: 1, asOf: "2020-01-01", fallbackToEarliest: false) {
+          status
+          requestedId
+          requestedDate
+          observation { date }
+          event { id slug }
+        }
+      }`,
+    );
+    assertEquals(fallbackDisabled, {
+      data: {
+        event: {
+          status: "NO_ARCHIVE_COVERAGE",
+          requestedId: 1,
+          requestedDate: "2020-01-01",
+          observation: null,
+          event: null,
+        },
+      },
+    });
+
+    const batch = await execute(
+      server,
+      `query Batch($inputs: [EventLookupInput!]!) {
+        events(inputs: $inputs) {
+          status
+          requestedId
+          requestedSlug
+          requestedDate
+          observation { date }
+          event { id slug }
+        }
+      }`,
+      {
+        inputs: [
+          { id: 1, asOf: "2026-01-06" },
+          { slug: "bushy-park", asOf: "2026-01-07" },
+          { id: 1, asOf: "2020-01-01" },
+          { id: 1, asOf: "2020-01-01", fallbackToEarliest: false },
+          { id: 2, slug: "bushy", asOf: "2026-01-06" },
+        ],
+      },
+    );
+    assertEquals(batch, {
+      data: {
+        events: [
+          {
+            status: "FOUND",
+            requestedId: 1,
+            requestedSlug: null,
+            requestedDate: "2026-01-06",
+            observation: { date: "2026-01-06" },
+            event: { id: 1, slug: "bushy" },
+          },
+          {
+            status: "FOUND",
+            requestedId: null,
+            requestedSlug: "bushy-park",
+            requestedDate: "2026-01-07",
+            observation: { date: "2026-01-07" },
+            event: { id: 1, slug: "bushy-park" },
+          },
+          {
+            status: "FOUND",
+            requestedId: 1,
+            requestedSlug: null,
+            requestedDate: "2020-01-01",
+            observation: { date: "2026-01-06" },
+            event: { id: 1, slug: "bushy" },
+          },
+          {
+            status: "NO_ARCHIVE_COVERAGE",
+            requestedId: 1,
+            requestedSlug: null,
+            requestedDate: "2020-01-01",
+            observation: null,
+            event: null,
+          },
+          {
+            status: "NOT_FOUND",
+            requestedId: 2,
+            requestedSlug: "bushy",
+            requestedDate: "2026-01-06",
+            observation: { date: "2026-01-06" },
+            event: null,
+          },
+        ],
+      },
+    });
+
+    const missingBoth = await execute(
+      server,
+      `query { event(asOf: "2026-01-06") { status } }`,
+    );
+    assertExists(missingBoth.errors);
+    assertEquals(
+      ((missingBoth.errors as Array<Record<string, unknown>>)[0]!
+        .extensions as Record<string, unknown>).code,
+      "BAD_USER_INPUT",
+    );
+
+    const zeroId = await execute(
+      server,
+      `query { event(id: 0, asOf: "2026-01-06") { status } }`,
+    );
+    assertExists(zeroId.errors);
+    assertEquals(
+      ((zeroId.errors as Array<Record<string, unknown>>)[0]!
+        .extensions as Record<string, unknown>).code,
+      "BAD_USER_INPUT",
+    );
+
+    const negativeId = await execute(
+      server,
+      `query { event(id: -5, asOf: "2026-01-06") { status } }`,
+    );
+    assertExists(negativeId.errors);
+    assertEquals(
+      ((negativeId.errors as Array<Record<string, unknown>>)[0]!
+        .extensions as Record<string, unknown>).code,
+      "BAD_USER_INPUT",
+    );
+
+    const batchMissingBoth = await execute(
+      server,
+      `query Batch($inputs: [EventLookupInput!]!) {
+        events(inputs: $inputs) { status }
+      }`,
+      { inputs: [{ asOf: "2026-01-06" }] },
+    );
+    assertExists(batchMissingBoth.errors);
+    assertEquals(
+      ((batchMissingBoth.errors as Array<Record<string, unknown>>)[0]!
+        .extensions as Record<string, unknown>).code,
+      "BAD_USER_INPUT",
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GraphQL exposes latestCountryCodes on archiveInfo and countries query", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const archive = new KvArchive(kv);
+    await publish(
+      archive,
+      [event(1, "bushy", 97), event(2, "albert", 3)],
+      "2026-01-06",
+    );
+    await publish(
+      archive,
+      [event(1, "bushy", 97), event(2, "albert", 3), event(3, "delta", 14)],
+      "2026-01-07",
+    );
+    const server = createGraphqlServer(archive);
+
+    const infoResult = await execute(
+      server,
+      `query {
+        archiveInfo {
+          latestEventCount
+          latestCountryCodes
+        }
+      }`,
+    );
+    assertEquals(infoResult, {
+      data: {
+        archiveInfo: {
+          latestEventCount: 3,
+          latestCountryCodes: [3, 14, 97],
+        },
+      },
+    });
+
+    const latestCountries = await execute(
+      server,
+      `query {
+        countries {
+          code
+          url
+          eventCount
+        }
+      }`,
+    );
+    assertEquals(latestCountries, {
+      data: {
+        countries: [
+          { code: 3, url: "https://www.parkrun.example", eventCount: 1 },
+          { code: 14, url: "https://www.parkrun.example", eventCount: 1 },
+          { code: 97, url: "https://www.parkrun.org.uk", eventCount: 1 },
+        ],
+      },
+    });
+
+    const historicalCountries = await execute(
+      server,
+      `query {
+        countries(asOf: "2026-01-06") {
+          code
+          eventCount
+        }
+      }`,
+    );
+    assertEquals(historicalCountries, {
+      data: {
+        countries: [
+          { code: 3, eventCount: 1 },
+          { code: 97, eventCount: 1 },
+        ],
+      },
+    });
+
+    const preArchiveCountries = await execute(
+      server,
+      `query {
+        countries(asOf: "2020-01-01") {
+          code
+          eventCount
+        }
+      }`,
+    );
+    assertEquals(preArchiveCountries, {
+      data: {
+        countries: [
+          { code: 3, eventCount: 1 },
+          { code: 97, eventCount: 1 },
+        ],
+      },
+    });
   } finally {
     kv.close();
   }

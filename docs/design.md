@@ -8,10 +8,11 @@ accepted observations in Deno KV.
 
 The public GraphQL API answers:
 
-- what metadata a slug had on a UTC date;
-- several independent slug/date lookups in one ordered batch;
+- what metadata an event (identified by numeric ID or slug) had on a UTC date;
+- several independent ID or slug lookups in one ordered batch;
 - which events appeared, disappeared, or changed over time;
-- the complete change history for one numeric event ID.
+- the complete change history for one numeric event ID;
+- the active countries, websites, and event counts.
 
 History starts with the earliest trusted full-catalogue snapshot. The service
 never labels current data as historical data and never infers missing history.
@@ -35,8 +36,12 @@ claim when a real-world change took effect.
 - Fetch the live source daily at 03:00 UTC.
 - Retain accepted history indefinitely.
 - Treat the source numeric ID as event identity.
-- Treat slugs as observation-scoped query keys.
+- Support lookup by numeric event ID, slug, or both.
 - Resolve a date to the latest accepted observation on or before that UTC date.
+- By default, fall back to the earliest observation when dates prior to the
+  archive start are requested (`fallbackToEarliest: true`), returning
+  `NO_ARCHIVE_COVERAGE` only when explicitly requested
+  (`fallbackToEarliest: false`).
 - Preserve batch input order and duplicates; allow at most 100 inputs.
 - Return every accepted transition in chronological order.
 - Quarantine large changes until a later valid fetch confirms them.
@@ -52,25 +57,36 @@ guarantee.
 
 ### Event lookup
 
-`event(slug, asOf)` returns one of three states:
+`event(id, slug, asOf, fallbackToEarliest = true)` returns one of three states:
 
 - `FOUND`: an observation and event are present;
-- `NOT_FOUND`: an observation is present but the slug is absent;
-- `NO_ARCHIVE_COVERAGE`: no accepted observation exists on or before the date.
+- `NOT_FOUND`: an observation is present but the event is absent;
+- `NO_ARCHIVE_COVERAGE`: the requested date is earlier than the archive and
+  `fallbackToEarliest` is false.
 
 A future date resolves to the latest accepted observation. A missed, invalid, or
-quarantined day falls back visibly to the preceding accepted observation.
+quarantined day falls back visibly to the preceding accepted observation. Dates
+prior to the archive baseline resolve to the baseline observation by default.
 
-After a rename, the old slug resolves only during its active period. The new
-slug resolves to the same numeric ID from the rename onward.
+After a rename, the numeric ID remains stable across both observations; the old
+slug resolves only during its active period, and the new slug resolves from the
+rename onward.
 
 ### Batch lookup
 
-`events(inputs)` accepts 1 through 100 independent slug/date pairs. Results
-preserve input order, length, and duplicates.
+`events(inputs)` accepts 1 through 100 independent ID/slug and date inputs.
+Results preserve input order, length, and duplicates.
 
 The resolver groups repeated dates, revisions, and buckets, batches KV reads in
-groups of at most 10, and restores the original order.
+groups of at most 10, and restores the original order. Point reads for numeric
+IDs are indexed per revision.
+
+### Countries
+
+`countries(asOf)` returns the active country codes, country home URLs, and event
+counts sorted by numeric country code ascending.
+`archiveInfo.latestCountryCodes` provides direct access to active country code
+integers.
 
 ### Change queries
 

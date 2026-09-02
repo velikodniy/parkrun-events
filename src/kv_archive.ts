@@ -6,6 +6,7 @@ import type {
   ChangeKind,
   ChangeReference,
   ChangeSetManifest,
+  CountryInfo,
   EventChangePage,
   EventLookupInput,
   EventLookupResult,
@@ -40,6 +41,8 @@ const PREFIX = ["parkrun-events", "v1"] as const;
 const EVENT_PREFIX = [...PREFIX, "event"] as const;
 const BUCKET_PREFIX = [...PREFIX, "bucket"] as const;
 const REVISION_PREFIX = [...PREFIX, "revision"] as const;
+const REVISION_ID_PREFIX = [...PREFIX, "revision-id"] as const;
+const REVISION_COUNTRIES_PREFIX = [...PREFIX, "revision-countries"] as const;
 const OBSERVATION_PREFIX = [...PREFIX, "observation"] as const;
 const CHANGE_DATE_PREFIX = [...PREFIX, "change-by-date"] as const;
 const CHANGE_SET_PREFIX = [...PREFIX, "change-set"] as const;
@@ -54,6 +57,11 @@ const MAX_ATOMIC_STAGE_BYTES = 500 * 1024;
 const CHANGE_PAGE_ITEMS = 50;
 const MAX_ARCHIVE_EVENT_COUNT = 100_000;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+
+interface RevisionIdEntry {
+  readonly slug: string;
+  readonly eventHash: string;
+}
 
 interface ImmutableItem<T> {
   readonly key: Deno.KvKey;
@@ -75,6 +83,8 @@ export class ArchiveCorruptError extends Error {
 }
 
 export class KvArchive {
+  private readonly manifestCache = new Map<string, RevisionManifest>();
+
   constructor(private readonly kv: Deno.Kv) {}
 
   async stageRevision(revision: CatalogueRevision): Promise<void> {
@@ -97,11 +107,88 @@ export class KvArchive {
       }));
     await this.putImmutableItems(bucketItems);
 
-    await this.putImmutableItems([{
-      key: revisionKey(revision.hash),
-      value: revision.manifest,
-      encoded: JSON.stringify(revision.manifest),
-    }]);
+    const idItems: ImmutableItem<RevisionIdEntry>[] = [
+      ...revision.eventsById.values(),
+    ].map(({ event, hash }) => ({
+      key: revisionIdKey(revision.hash, event.id),
+      value: { slug: event.slug, eventHash: hash },
+      encoded: JSON.stringify([event.slug, hash]),
+    }));
+    await this.putImmutableItems(idItems);
+
+    await this.putImmutableItems([
+      {
+        key: revisionKey(revision.hash),
+        value: revision.manifest,
+        encoded: JSON.stringify(revision.manifest),
+      },
+    ]);
+
+    await this.putImmutableItems([
+      {
+        key: revisionCountriesKey(revision.hash),
+        value: revision.countries,
+        encoded: JSON.stringify(revision.countries),
+      },
+    ]);
+  }
+
+  async ensureRevisionIndexed(
+    revisionHash: string,
+  ): Promise<CatalogueRevision | null> {
+    const check = await this.kv.get<readonly CountryInfo[]>(
+      revisionCountriesKey(revisionHash),
+      { consistency: "strong" },
+    );
+    if (check.value !== null) {
+      return null;
+    }
+
+    const revision = await this.loadRevision(revisionHash);
+    const idItems: ImmutableItem<RevisionIdEntry>[] = [
+      ...revision.eventsById.values(),
+    ].map(({ event, hash }) => ({
+      key: revisionIdKey(revision.hash, event.id),
+      value: { slug: event.slug, eventHash: hash },
+      encoded: JSON.stringify([event.slug, hash]),
+    }));
+    await this.putImmutableItems(idItems);
+    await this.putImmutableItems([
+      {
+        key: revisionCountriesKey(revision.hash),
+        value: revision.countries,
+        encoded: JSON.stringify(revision.countries),
+      },
+    ]);
+    return revision;
+  }
+
+  async backfillIndexes(): Promise<{
+    readonly totalObservations: number;
+    readonly totalRevisions: number;
+    readonly newlyIndexedRevisions: number;
+  }> {
+    const revisions = new Set<string>();
+    let observationCount = 0;
+    const entries = this.kv.list<ObservationRecord>({
+      prefix: OBSERVATION_PREFIX,
+    }, { consistency: "strong" });
+    for await (const entry of entries) {
+      observationCount += 1;
+      revisions.add(entry.value.revisionHash);
+    }
+    let newlyIndexedRevisions = 0;
+    for (const hash of revisions) {
+      const indexed = await this.ensureRevisionIndexed(hash);
+      if (indexed !== null) {
+        newlyIndexedRevisions += 1;
+      }
+    }
+    return {
+      totalObservations: observationCount,
+      totalRevisions: revisions.size,
+      newlyIndexedRevisions,
+    };
   }
 
   async stageChangeSet(
@@ -446,12 +533,39 @@ export class KvArchive {
       throw new ArchiveCorruptError("Revision event count is incorrect");
     }
 
+    const countryMap = new Map<
+      number,
+      { code: number; url: string; count: number }
+    >();
+    for (const { event } of eventsById.values()) {
+      const existing = countryMap.get(event.countryCode);
+      if (existing === undefined) {
+        countryMap.set(event.countryCode, {
+          code: event.countryCode,
+          url: event.countryUrl,
+          count: 1,
+        });
+      } else {
+        existing.count += 1;
+      }
+    }
+    const countries = [...countryMap.values()]
+      .sort((left, right) => left.code - right.code)
+      .map((item) => ({
+        code: item.code,
+        url: item.url,
+        eventCount: item.count,
+      }));
+    const countryCodes = countries.map((c) => c.code);
+
     return {
       hash,
       manifest,
       bucketHashes: manifest.bucketHashes,
       buckets,
       eventsById,
+      countries,
+      countryCodes,
     };
   }
 
@@ -463,63 +577,184 @@ export class KvArchive {
         "Event lookup batch must contain 1 through 100 inputs",
       );
     }
-    const normalized = inputs.map((input) => ({
-      slug: input.slug.trim().toLowerCase(),
-      asOf: parseUtcDate(input.asOf),
-    }));
-    const observations = new Map<string, ObservationRecord | null>();
-    const requestedDates = [...new Set(normalized.map((input) => input.asOf))];
+    const normalized = inputs.map((input) => {
+      const hasId = input.id !== undefined && input.id !== null;
+      const hasSlug = input.slug !== undefined && input.slug !== null;
+      if (!hasId && !hasSlug) {
+        throw new RangeError("Each lookup input must provide an id or slug");
+      }
+      if (
+        hasId &&
+        (!Number.isSafeInteger(input.id) || (input.id as number) <= 0)
+      ) {
+        throw new RangeError("Event ID must be a positive integer");
+      }
+      const slug = hasSlug ? input.slug!.trim().toLowerCase() : undefined;
+      return {
+        id: hasId ? (input.id as number) : undefined,
+        slug,
+        asOf: parseUtcDate(input.asOf),
+        fallbackToEarliest: input.fallbackToEarliest ?? true,
+      };
+    });
+
+    const headEntry = await this.kv.get<ArchiveHead>(HEAD_KEY, {
+      consistency: "strong",
+    });
+    const head = headEntry.value;
+
+    if (head === null) {
+      return normalized.map((input) =>
+        lookupResult("NO_ARCHIVE_COVERAGE", input, null, null)
+      );
+    }
+
+    validateHeadRecord(head);
+
+    const targetDates = normalized.map((input) => {
+      if (input.asOf < head.firstObservationDate) {
+        return input.fallbackToEarliest ? head.firstObservationDate : null;
+      }
+      return input.asOf;
+    });
+
+    const uniqueDates = [
+      ...new Set(targetDates.filter((date): date is string => date !== null)),
+    ];
     const resolvedObservations = await mapWithConcurrency(
-      requestedDates,
+      uniqueDates,
       MAX_READ_CONCURRENCY,
       (date) => this.findObservation(date),
     );
-    requestedDates.forEach((date, index) => {
+    const observations = new Map<string, ObservationRecord | null>();
+    uniqueDates.forEach((date, index) => {
       observations.set(date, resolvedObservations[index]!);
     });
 
-    const manifests = new Map<string, RevisionManifest>();
-    const coveredRevisions = [
+    const inputObservations = targetDates.map((targetDate) =>
+      targetDate === null ? null : observations.get(targetDate) ?? null
+    );
+
+    const revisionsNeedingManifest = [
       ...new Set(
-        [...observations.values()].flatMap((observation) =>
-          observation === null ? [] : [observation.revisionHash]
-        ),
+        normalized
+          .map((input, index) => ({ input, obs: inputObservations[index] }))
+          .filter(({ input, obs }) => input.id === undefined && obs !== null)
+          .map(({ obs }) => obs!.revisionHash),
       ),
     ];
-    const resolvedManifests = await mapWithConcurrency(
-      coveredRevisions,
-      MAX_READ_CONCURRENCY,
-      (hash) => this.getRevisionManifest(hash),
-    );
-    coveredRevisions.forEach((hash, index) => {
-      manifests.set(hash, resolvedManifests[index]!);
-    });
-    for (const observation of observations.values()) {
-      if (
-        observation !== null &&
-        manifests.get(observation.revisionHash)?.eventCount !==
-          observation.eventCount
-      ) {
-        throw new ArchiveCorruptError(
-          "Observation event count does not match its revision",
-        );
+
+    const manifests = new Map<string, RevisionManifest>();
+    if (revisionsNeedingManifest.length > 0) {
+      const resolvedManifests = await mapWithConcurrency(
+        revisionsNeedingManifest,
+        MAX_READ_CONCURRENCY,
+        (hash) => this.getRevisionManifest(hash),
+      );
+      revisionsNeedingManifest.forEach((hash, index) => {
+        manifests.set(hash, resolvedManifests[index]!);
+      });
+      for (const [index, obs] of inputObservations.entries()) {
+        if (obs !== null && normalized[index]!.id === undefined) {
+          if (manifests.get(obs.revisionHash)?.eventCount !== obs.eventCount) {
+            throw new ArchiveCorruptError(
+              "Observation event count does not match its revision",
+            );
+          }
+        }
       }
     }
 
-    const work = await Promise.all(normalized.map(async (input, index) => {
-      const observation = observations.get(input.asOf) ?? null;
-      if (observation === null) {
-        return { index, input, observation, bucketHash: null };
+    interface ItemLookupWork {
+      readonly index: number;
+      readonly input: (typeof normalized)[number];
+      readonly observation: ObservationRecord | null;
+      readonly isIdLookup: boolean;
+      readonly bucketHash: string | null;
+    }
+
+    const work: ItemLookupWork[] = await Promise.all(
+      normalized.map(async (input, index) => {
+        const observation = inputObservations[index]!;
+        if (observation === null) {
+          return {
+            index,
+            input,
+            observation: null,
+            isIdLookup: false,
+            bucketHash: null,
+          };
+        }
+        if (input.id !== undefined) {
+          return {
+            index,
+            input,
+            observation,
+            isIdLookup: true,
+            bucketHash: null,
+          };
+        }
+        const manifest = manifests.get(observation.revisionHash)!;
+        const bucketIndex = await bucketIndexForSlug(input.slug!);
+        return {
+          index,
+          input,
+          observation,
+          isIdLookup: false,
+          bucketHash: manifest.bucketHashes[bucketIndex]!,
+        };
+      }),
+    );
+
+    const idWork = work.filter((item) => item.isIdLookup);
+    const uniqueIdKeys = [
+      ...new Set(
+        idWork.map((item) =>
+          JSON.stringify(
+            revisionIdKey(item.observation!.revisionHash, item.input.id!),
+          )
+        ),
+      ),
+    ].map((keyJson) => JSON.parse(keyJson) as Deno.KvKey);
+
+    const idRows = await this.getMany<RevisionIdEntry>(uniqueIdKeys);
+    const idEntriesByKey = new Map<string, RevisionIdEntry | null>();
+    uniqueIdKeys.forEach((key, index) => {
+      idEntriesByKey.set(JSON.stringify(key), idRows[index]!.value);
+    });
+
+    const revisionsWithNullIds = [
+      ...new Set(
+        idWork
+          .filter((item) => {
+            const key = JSON.stringify(
+              revisionIdKey(item.observation!.revisionHash, item.input.id!),
+            );
+            return idEntriesByKey.get(key) === null;
+          })
+          .map((item) => item.observation!.revisionHash),
+      ),
+    ];
+
+    for (const revisionHash of revisionsWithNullIds) {
+      const newlyIndexed = await this.ensureRevisionIndexed(revisionHash);
+      if (newlyIndexed !== null) {
+        for (const item of idWork) {
+          if (item.observation!.revisionHash === revisionHash) {
+            const key = JSON.stringify(
+              revisionIdKey(revisionHash, item.input.id!),
+            );
+            const hashed = newlyIndexed.eventsById.get(item.input.id!);
+            if (hashed !== undefined) {
+              idEntriesByKey.set(key, {
+                slug: hashed.event.slug,
+                eventHash: hashed.hash,
+              });
+            }
+          }
+        }
       }
-      const manifest = manifests.get(observation.revisionHash)!;
-      const bucketIndex = await bucketIndexForSlug(input.slug);
-      return {
-        index,
-        input,
-        observation,
-        bucketHash: manifest.bucketHashes[bucketIndex]!,
-      };
-    }));
+    }
 
     const uniqueBucketHashes = [
       ...new Set(
@@ -542,16 +777,27 @@ export class KvArchive {
       buckets.set(hash, entries);
     }
 
-    const matchedEntries = work.map((item) =>
-      item.bucketHash === null
-        ? null
-        : findBucketEntry(buckets.get(item.bucketHash)!, item.input.slug)
-    );
+    const itemEventHashes: (string | null)[] = work.map((item) => {
+      if (item.observation === null) return null;
+      if (item.isIdLookup) {
+        const key = JSON.stringify(
+          revisionIdKey(item.observation.revisionHash, item.input.id!),
+        );
+        const entry = idEntriesByKey.get(key) ?? null;
+        if (entry === null) return null;
+        if (item.input.slug !== undefined && entry.slug !== item.input.slug) {
+          return null;
+        }
+        return entry.eventHash;
+      }
+      const bucketEntries = buckets.get(item.bucketHash!)!;
+      const entry = findBucketEntry(bucketEntries, item.input.slug!);
+      return entry?.eventHash ?? null;
+    });
+
     const uniqueEventHashes = [
       ...new Set(
-        matchedEntries.flatMap((entry) =>
-          entry === null ? [] : [entry.eventHash]
-        ),
+        itemEventHashes.filter((hash): hash is string => hash !== null),
       ),
     ];
     const eventRows = await this.getMany<EventRecord>(
@@ -569,23 +815,22 @@ export class KvArchive {
     }
 
     return work.map((item, index): EventLookupResult => {
-      const publicObservation = item.observation === null
-        ? null
-        : toPublicObservation(item.observation);
-      const entry = matchedEntries[index]!;
       if (item.observation === null) {
         return lookupResult("NO_ARCHIVE_COVERAGE", item.input, null, null);
       }
-      if (entry === null) {
+      const publicObservation = toPublicObservation(item.observation);
+      const eventHash = itemEventHashes[index]!;
+      if (eventHash === null) {
         return lookupResult("NOT_FOUND", item.input, publicObservation, null);
       }
-      const event = events.get(entry.eventHash);
+      const event = events.get(eventHash);
       if (
-        event === undefined || event.id !== entry.id ||
-        event.slug !== entry.slug
+        event === undefined ||
+        (item.input.id !== undefined && event.id !== item.input.id) ||
+        (item.input.slug !== undefined && event.slug !== item.input.slug)
       ) {
         throw new ArchiveCorruptError(
-          "Slug index points to an inconsistent event",
+          "Event index points to an inconsistent event",
         );
       }
       return lookupResult("FOUND", item.input, publicObservation, event);
@@ -778,6 +1023,42 @@ export class KvArchive {
     };
   }
 
+  async getCountries(asOf?: string): Promise<readonly CountryInfo[]> {
+    const head = await this.kv.get<ArchiveHead>(HEAD_KEY, {
+      consistency: "strong",
+    });
+    if (head.value === null) {
+      return [];
+    }
+    validateHeadRecord(head.value);
+
+    let targetDate: string;
+    if (asOf !== undefined && asOf !== null) {
+      const parsedDate = parseUtcDate(asOf);
+      targetDate = parsedDate < head.value.firstObservationDate
+        ? head.value.firstObservationDate
+        : parsedDate;
+    } else {
+      targetDate = head.value.date;
+    }
+
+    const observation = await this.findObservation(targetDate);
+    if (observation === null) {
+      return [];
+    }
+
+    const cached = await this.kv.get<readonly CountryInfo[]>(
+      revisionCountriesKey(observation.revisionHash),
+      { consistency: "strong" },
+    );
+    if (cached.value !== null) {
+      return cached.value;
+    }
+
+    const revision = await this.loadRevision(observation.revisionHash);
+    return revision.countries;
+  }
+
   async getArchiveInfo(): Promise<ArchiveInfo> {
     const head = await this.kv.get<ArchiveHead>(HEAD_KEY, {
       consistency: "strong",
@@ -787,6 +1068,7 @@ export class KvArchive {
         firstObservation: null,
         latestObservation: null,
         latestEventCount: null,
+        latestCountryCodes: [],
       };
     }
     validateHeadRecord(head.value);
@@ -818,10 +1100,14 @@ export class KvArchive {
         "Latest observation does not match its revision",
       );
     }
+    const countries = await this.getCountries(head.value.date);
+    const latestCountryCodes = countries.map((country) => country.code);
+
     return {
       firstObservation: toPublicObservation(first.value),
       latestObservation: toPublicObservation(latest.value),
       latestEventCount: latest.value.eventCount,
+      latestCountryCodes,
     };
   }
 
@@ -856,6 +1142,10 @@ export class KvArchive {
   }
 
   private async getRevisionManifest(hash: string): Promise<RevisionManifest> {
+    const cached = this.manifestCache.get(hash);
+    if (cached !== undefined) {
+      return cached;
+    }
     validateHash(hash, "revision hash");
     const entry = await this.kv.get<unknown>(revisionKey(hash), {
       consistency: "strong",
@@ -865,6 +1155,7 @@ export class KvArchive {
     }
     const manifest = validateRevisionManifest(entry.value);
     await verifyHash(hash, canonicalRevisionJson(manifest), "revision");
+    this.manifestCache.set(hash, manifest);
     return manifest;
   }
 
@@ -1251,6 +1542,14 @@ function revisionKey(hash: string): Deno.KvKey {
   return [...REVISION_PREFIX, hash];
 }
 
+function revisionIdKey(hash: string, id: number): Deno.KvKey {
+  return [...REVISION_ID_PREFIX, hash, id];
+}
+
+function revisionCountriesKey(hash: string): Deno.KvKey {
+  return [...REVISION_COUNTRIES_PREFIX, hash];
+}
+
 function observationKey(date: string): Deno.KvKey {
   return [...OBSERVATION_PREFIX, date];
 }
@@ -1279,13 +1578,18 @@ function toPublicObservation(
 
 function lookupResult(
   status: EventLookupResult["status"],
-  input: EventLookupInput,
+  input: {
+    readonly id?: number | undefined;
+    readonly slug?: string | undefined;
+    readonly asOf: string;
+  },
   observation: PublicObservation | null,
   event: EventRecord | null,
 ): EventLookupResult {
   return {
     status,
-    requestedSlug: input.slug,
+    requestedId: input.id ?? null,
+    requestedSlug: input.slug ?? null,
     requestedDate: input.asOf,
     observation,
     event,

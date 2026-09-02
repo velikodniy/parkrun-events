@@ -20,15 +20,37 @@ use GraphiQL, or send a GraphQL request with any HTTP client.
 ```sh
 curl https://parkrun-events.vlcdn.dev/graphql \
   -H 'content-type: application/json' \
-  --data '{"query":"{ archiveInfo { firstObservation { date } latestObservation { date } latestEventCount } }"}'
+  --data '{"query":"{ archiveInfo { firstObservation { date } latestObservation { date } latestEventCount latestCountryCodes } }"}'
 ```
+
+## Look up countries
+
+Active parkrun countries can be listed with their code, official website URL,
+and active event count:
+
+```graphql
+query ActiveCountries {
+  countries {
+    code
+    url
+    eventCount
+  }
+}
+```
+
+An optional `asOf` date argument is supported to query historical country lists.
 
 ## Look up one event
 
+Events can be looked up by numeric `id`, `slug`, or both:
+
 ```graphql
 query EventOnDate {
-  event(slug: "bushy", asOf: "2026-08-24") {
+  event(id: 1, asOf: "2026-08-24") {
     status
+    requestedId
+    requestedSlug
+    requestedDate
     observation {
       date
       fetchedAt
@@ -54,21 +76,30 @@ query EventOnDate {
 The API selects the latest successful observation on or before `asOf`. The
 returned `observation.date` shows which catalogue day was actually used.
 
+When `fallbackToEarliest` is `true` (default), querying a date earlier than
+`firstObservation.date` resolves against the earliest known observation
+(baseline), providing event metadata for athletes whose run history extends
+prior to the archive start date. Pass `fallbackToEarliest: false` to return
+`NO_ARCHIVE_COVERAGE` instead.
+
 ### Lookup statuses
 
-- `FOUND` — the slug existed in the selected observation.
-- `NOT_FOUND` — the date is covered, but the slug did not exist then.
-- `NO_ARCHIVE_COVERAGE` — the requested date is earlier than the archive.
+- `FOUND` — the event existed in the selected observation.
+- `NOT_FOUND` — the date is covered, but the event did not exist then.
+- `NO_ARCHIVE_COVERAGE` — the requested date is earlier than the archive (when
+  `fallbackToEarliest: false`).
 
 ## Look up several events
 
-Each item can use a different date. Results remain in the same order as the
-inputs, including duplicates. A request can contain up to 100 items.
+Each item can specify an `id`, `slug`, or both, along with its own date and
+optional `fallbackToEarliest`. Results remain in the same order as the inputs,
+including duplicates. A request can contain up to 100 items.
 
 ```graphql
 query EventsOnDates($inputs: [EventLookupInput!]!) {
   events(inputs: $inputs) {
     status
+    requestedId
     requestedSlug
     requestedDate
     observation {
@@ -89,8 +120,10 @@ Variables:
 ```json
 {
   "inputs": [
+    { "id": 1, "asOf": "2026-08-01" },
     { "slug": "bushy", "asOf": "2026-08-01" },
-    { "slug": "wimbledon", "asOf": "2026-08-15" },
+    { "id": 105, "slug": "wimbledon", "asOf": "2026-08-15" },
+    { "id": 1, "asOf": "2010-01-01", "fallbackToEarliest": true },
     { "slug": "old-event-slug", "asOf": "2027-01-01" }
   ]
 }
@@ -206,3 +239,9 @@ successful observation.
 History begins with the earliest accepted live observation or imported
 full-catalogue snapshot. The archive never infers past states from current data,
 so coverage before that date depends on trustworthy dated snapshots.
+
+## Indexing
+
+The archive indexes numeric event IDs and active country counts per revision.
+Existing historical revisions in KV that were created prior to this indexing are
+self-healed automatically on first access during queries.

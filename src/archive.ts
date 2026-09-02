@@ -47,9 +47,17 @@ export interface PublishObservationInput {
   readonly confirmedAnomaly: boolean;
 }
 
+export interface CountryInfo {
+  readonly code: number;
+  readonly url: string;
+  readonly eventCount: number;
+}
+
 export interface EventLookupInput {
-  readonly slug: string;
+  readonly id?: number | undefined;
+  readonly slug?: string | undefined;
   readonly asOf: UtcDate;
+  readonly fallbackToEarliest?: boolean | undefined;
 }
 
 export type EventLookupStatus =
@@ -59,7 +67,8 @@ export type EventLookupStatus =
 
 export interface EventLookupResult {
   readonly status: EventLookupStatus;
-  readonly requestedSlug: string;
+  readonly requestedId: number | null;
+  readonly requestedSlug: string | null;
   readonly requestedDate: UtcDate;
   readonly observation: PublicObservation | null;
   readonly event: EventRecord | null;
@@ -92,6 +101,7 @@ export interface ArchiveInfo {
   readonly firstObservation: PublicObservation | null;
   readonly latestObservation: PublicObservation | null;
   readonly latestEventCount: number | null;
+  readonly latestCountryCodes: readonly number[];
 }
 
 export interface CatalogueChangeSummary {

@@ -1,3 +1,5 @@
+import type { CountryInfo } from "./archive.ts";
+
 export const EVENT_ENCODING_VERSION = "event-v1";
 export const BUCKET_ENCODING_VERSION = "bucket-v1";
 export const REVISION_ENCODING_VERSION = "revision-v1";
@@ -56,6 +58,8 @@ export interface CatalogueRevision {
   readonly bucketHashes: readonly string[];
   readonly buckets: readonly RevisionBucket[];
   readonly eventsById: ReadonlyMap<number, HashedEvent>;
+  readonly countries: readonly CountryInfo[];
+  readonly countryCodes: readonly number[];
 }
 
 export interface AppearedChange {
@@ -183,12 +187,39 @@ export async function buildRevision(
     bucketHashes,
   };
 
+  const countryMap = new Map<
+    number,
+    { code: number; url: string; count: number }
+  >();
+  for (const event of events) {
+    const existing = countryMap.get(event.countryCode);
+    if (existing === undefined) {
+      countryMap.set(event.countryCode, {
+        code: event.countryCode,
+        url: event.countryUrl,
+        count: 1,
+      });
+    } else {
+      existing.count += 1;
+    }
+  }
+  const countries = [...countryMap.values()]
+    .sort((left, right) => left.code - right.code)
+    .map((item) => ({
+      code: item.code,
+      url: item.url,
+      eventCount: item.count,
+    }));
+  const countryCodes = countries.map((c) => c.code);
+
   return {
     hash: await sha256Hex(canonicalRevisionJson(manifest)),
     manifest,
     bucketHashes,
     buckets,
     eventsById,
+    countries,
+    countryCodes,
   };
 }
 
