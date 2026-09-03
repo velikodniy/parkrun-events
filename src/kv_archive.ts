@@ -42,6 +42,7 @@ const EVENT_PREFIX = [...PREFIX, "event"] as const;
 const BUCKET_PREFIX = [...PREFIX, "bucket"] as const;
 const REVISION_PREFIX = [...PREFIX, "revision"] as const;
 const REVISION_ID_PREFIX = [...PREFIX, "revision-id"] as const;
+const REVISION_ID_INDEXED_PREFIX = [...PREFIX, "revision-id-indexed"] as const;
 const REVISION_COUNTRIES_PREFIX = [...PREFIX, "revision-countries"] as const;
 const OBSERVATION_PREFIX = [...PREFIX, "observation"] as const;
 const CHANGE_DATE_PREFIX = [...PREFIX, "change-by-date"] as const;
@@ -83,8 +84,6 @@ export class ArchiveCorruptError extends Error {
 }
 
 export class KvArchive {
-  private readonly manifestCache = new Map<string, RevisionManifest>();
-
   constructor(private readonly kv: Deno.Kv) {}
 
   async stageRevision(revision: CatalogueRevision): Promise<void> {
@@ -131,28 +130,84 @@ export class KvArchive {
         encoded: JSON.stringify(revision.countries),
       },
     ]);
+    await this.putImmutableItems([
+      {
+        key: revisionIdIndexedKey(revision.hash),
+        value: true,
+        encoded: JSON.stringify(true),
+      },
+    ]);
   }
 
   async ensureRevisionIndexed(
     revisionHash: string,
-  ): Promise<CatalogueRevision | null> {
-    const check = await this.kv.get<readonly CountryInfo[]>(
-      revisionCountriesKey(revisionHash),
-      { consistency: "strong" },
-    );
-    if (check.value !== null) {
+  ): Promise<Map<number, RevisionIdEntry> | null> {
+    const isIndexed = await this.isRevisionIdIndexed(revisionHash);
+    if (isIndexed) {
       return null;
     }
 
-    const revision = await this.loadRevision(revisionHash);
+    const manifest = await this.getRevisionManifest(revisionHash);
+    const uniqueBucketHashes = [...new Set(manifest.bucketHashes)];
+    const bucketRows = await this.getMany<readonly BucketEntry[]>(
+      uniqueBucketHashes.map(bucketKey),
+    );
+    const bucketsByHash = new Map<string, readonly BucketEntry[]>();
+    for (let index = 0; index < uniqueBucketHashes.length; index += 1) {
+      const bucketHash = uniqueBucketHashes[index]!;
+      const entries = bucketRows[index]!.value;
+      if (entries === null) {
+        throw new ArchiveCorruptError(`Missing bucket ${bucketHash}`);
+      }
+      await verifyHash(bucketHash, canonicalBucketJson(entries), "bucket");
+      bucketsByHash.set(bucketHash, entries);
+    }
+
+    const entriesById = new Map<number, RevisionIdEntry>();
+    for (const bucketHash of uniqueBucketHashes) {
+      const entries = bucketsByHash.get(bucketHash)!;
+      for (const entry of entries) {
+        entriesById.set(entry.id, {
+          slug: entry.slug,
+          eventHash: entry.eventHash,
+        });
+      }
+    }
+
+    if (entriesById.size !== manifest.eventCount) {
+      throw new ArchiveCorruptError(
+        "Revision bucket index does not match event count",
+      );
+    }
+
     const idItems: ImmutableItem<RevisionIdEntry>[] = [
-      ...revision.eventsById.values(),
-    ].map(({ event, hash }) => ({
-      key: revisionIdKey(revision.hash, event.id),
-      value: { slug: event.slug, eventHash: hash },
-      encoded: JSON.stringify([event.slug, hash]),
+      ...entriesById.entries(),
+    ].map(([id, value]) => ({
+      key: revisionIdKey(revisionHash, id),
+      value,
+      encoded: JSON.stringify([value.slug, value.eventHash]),
     }));
+
     await this.putImmutableItems(idItems);
+    await this.putImmutableItems([
+      {
+        key: revisionIdIndexedKey(revisionHash),
+        value: true,
+        encoded: JSON.stringify(true),
+      },
+    ]);
+
+    return entriesById;
+  }
+
+  async ensureCountriesIndexed(
+    revisionHash: string,
+  ): Promise<readonly CountryInfo[] | null> {
+    const isIndexed = await this.isRevisionCountriesIndexed(revisionHash);
+    if (isIndexed) {
+      return null;
+    }
+    const revision = await this.loadRevision(revisionHash);
     await this.putImmutableItems([
       {
         key: revisionCountriesKey(revision.hash),
@@ -160,14 +215,44 @@ export class KvArchive {
         encoded: JSON.stringify(revision.countries),
       },
     ]);
-    return revision;
+    return revision.countries;
   }
 
-  async backfillIndexes(): Promise<{
+  private async isRevisionIdIndexed(hash: string): Promise<boolean> {
+    const [indexedEntry, countryEntry] = await this.getMany<unknown>([
+      revisionIdIndexedKey(hash),
+      revisionCountriesKey(hash),
+    ]);
+    return (
+      (indexedEntry?.value !== null && indexedEntry?.value !== undefined) ||
+      (countryEntry?.value !== null && countryEntry?.value !== undefined)
+    );
+  }
+
+  private async isRevisionCountriesIndexed(hash: string): Promise<boolean> {
+    const check = await this.kv.get<readonly CountryInfo[]>(
+      revisionCountriesKey(hash),
+      { consistency: "strong" },
+    );
+    return check.value !== null;
+  }
+
+  async backfillIndexes(options?: {
+    readonly apply?: boolean;
+    readonly onProgress?: (progress: {
+      readonly revisionHash: string;
+      readonly current: number;
+      readonly total: number;
+      readonly newlyIndexed: boolean;
+      readonly newlyIndexedIds?: boolean;
+      readonly newlyIndexedCountries?: boolean;
+    }) => void;
+  }): Promise<{
     readonly totalObservations: number;
     readonly totalRevisions: number;
     readonly newlyIndexedRevisions: number;
   }> {
+    const apply = options?.apply ?? true;
     const revisions = new Set<string>();
     let observationCount = 0;
     const entries = this.kv.list<ObservationRecord>({
@@ -178,11 +263,40 @@ export class KvArchive {
       revisions.add(entry.value.revisionHash);
     }
     let newlyIndexedRevisions = 0;
+    let current = 0;
     for (const hash of revisions) {
-      const indexed = await this.ensureRevisionIndexed(hash);
-      if (indexed !== null) {
-        newlyIndexedRevisions += 1;
+      current += 1;
+      let newlyIndexedIds = false;
+      let newlyIndexedCountries = false;
+      if (apply) {
+        const idResult = await this.ensureRevisionIndexed(hash);
+        if (idResult !== null) {
+          newlyIndexedIds = true;
+        }
+        const countryResult = await this.ensureCountriesIndexed(hash);
+        if (countryResult !== null) {
+          newlyIndexedCountries = true;
+        }
+        if (newlyIndexedIds || newlyIndexedCountries) {
+          newlyIndexedRevisions += 1;
+        }
+      } else {
+        const isIdIndexed = await this.isRevisionIdIndexed(hash);
+        const isCountryIndexed = await this.isRevisionCountriesIndexed(hash);
+        newlyIndexedIds = !isIdIndexed;
+        newlyIndexedCountries = !isCountryIndexed;
+        if (newlyIndexedIds || newlyIndexedCountries) {
+          newlyIndexedRevisions += 1;
+        }
       }
+      options?.onProgress?.({
+        revisionHash: hash,
+        current,
+        total: revisions.size,
+        newlyIndexed: newlyIndexedIds || newlyIndexedCountries,
+        newlyIndexedIds,
+        newlyIndexedCountries,
+      });
     }
     return {
       totalObservations: observationCount,
@@ -717,13 +831,13 @@ export class KvArchive {
       ),
     ].map((keyJson) => JSON.parse(keyJson) as Deno.KvKey);
 
-    const idRows = await this.getMany<RevisionIdEntry>(uniqueIdKeys);
     const idEntriesByKey = new Map<string, RevisionIdEntry | null>();
+    const idRows = await this.getMany<RevisionIdEntry>(uniqueIdKeys);
     uniqueIdKeys.forEach((key, index) => {
       idEntriesByKey.set(JSON.stringify(key), idRows[index]!.value);
     });
 
-    const revisionsWithNullIds = [
+    const candidateRevisionHashes = [
       ...new Set(
         idWork
           .filter((item) => {
@@ -736,7 +850,7 @@ export class KvArchive {
       ),
     ];
 
-    for (const revisionHash of revisionsWithNullIds) {
+    for (const revisionHash of candidateRevisionHashes) {
       const newlyIndexed = await this.ensureRevisionIndexed(revisionHash);
       if (newlyIndexed !== null) {
         for (const item of idWork) {
@@ -744,12 +858,9 @@ export class KvArchive {
             const key = JSON.stringify(
               revisionIdKey(revisionHash, item.input.id!),
             );
-            const hashed = newlyIndexed.eventsById.get(item.input.id!);
-            if (hashed !== undefined) {
-              idEntriesByKey.set(key, {
-                slug: hashed.event.slug,
-                eventHash: hashed.hash,
-              });
+            const entry = newlyIndexed.get(item.input.id!);
+            if (entry !== undefined) {
+              idEntriesByKey.set(key, entry);
             }
           }
         }
@@ -1056,6 +1167,13 @@ export class KvArchive {
     }
 
     const revision = await this.loadRevision(observation.revisionHash);
+    await this.putImmutableItems([
+      {
+        key: revisionCountriesKey(observation.revisionHash),
+        value: revision.countries,
+        encoded: JSON.stringify(revision.countries),
+      },
+    ]);
     return revision.countries;
   }
 
@@ -1142,10 +1260,6 @@ export class KvArchive {
   }
 
   private async getRevisionManifest(hash: string): Promise<RevisionManifest> {
-    const cached = this.manifestCache.get(hash);
-    if (cached !== undefined) {
-      return cached;
-    }
     validateHash(hash, "revision hash");
     const entry = await this.kv.get<unknown>(revisionKey(hash), {
       consistency: "strong",
@@ -1155,22 +1269,26 @@ export class KvArchive {
     }
     const manifest = validateRevisionManifest(entry.value);
     await verifyHash(hash, canonicalRevisionJson(manifest), "revision");
-    this.manifestCache.set(hash, manifest);
     return manifest;
   }
 
   private async getMany<T>(
     keys: readonly Deno.KvKey[],
   ): Promise<readonly Deno.KvEntryMaybe<T>[]> {
-    const result: Deno.KvEntryMaybe<T>[] = [];
-    for (const keysChunk of chunk(keys, MAX_BATCH_KEYS)) {
-      const entries = await this.kv.getMany(
-        keysChunk as [Deno.KvKey, ...Deno.KvKey[]],
-        { consistency: "strong" },
-      );
-      result.push(...entries as Deno.KvEntryMaybe<T>[]);
+    if (keys.length === 0) {
+      return [];
     }
-    return result;
+    const keysChunks = chunk(keys, MAX_BATCH_KEYS);
+    const chunkResults = await mapWithConcurrency(
+      keysChunks,
+      MAX_READ_CONCURRENCY,
+      (keysChunk) =>
+        this.kv.getMany(
+          keysChunk as [Deno.KvKey, ...Deno.KvKey[]],
+          { consistency: "strong" },
+        ),
+    );
+    return chunkResults.flat() as Deno.KvEntryMaybe<T>[];
   }
 
   private async putImmutableItems<T>(
@@ -1187,9 +1305,12 @@ export class KvArchive {
       uniqueItems.set(keyString, item);
     }
 
-    for (const items of chunkImmutableItems([...uniqueItems.values()])) {
-      await this.putImmutableChunk(items, 0);
-    }
+    const chunks = chunkImmutableItems([...uniqueItems.values()]);
+    await mapWithConcurrency(
+      chunks,
+      MAX_READ_CONCURRENCY,
+      (items) => this.putImmutableChunk(items, 0),
+    );
   }
 
   private async putImmutableChunk<T>(
@@ -1544,6 +1665,10 @@ function revisionKey(hash: string): Deno.KvKey {
 
 function revisionIdKey(hash: string, id: number): Deno.KvKey {
   return [...REVISION_ID_PREFIX, hash, id];
+}
+
+function revisionIdIndexedKey(hash: string): Deno.KvKey {
+  return [...REVISION_ID_INDEXED_PREFIX, hash];
 }
 
 function revisionCountriesKey(hash: string): Deno.KvKey {

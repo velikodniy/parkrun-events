@@ -827,11 +827,17 @@ Deno.test("KvArchive self-heals unindexed legacy revisions during lookupMany", a
     ]);
     await archive.stageRevision(legacy);
 
-    // Simulate a legacy revision by removing revision-countries and revision-id keys
+    // Simulate a legacy revision by removing revision-countries, revision-id-indexed, and revision-id keys
     await kv.delete([
       "parkrun-events",
       "v1",
       "revision-countries",
+      legacy.hash,
+    ]);
+    await kv.delete([
+      "parkrun-events",
+      "v1",
+      "revision-id-indexed",
       legacy.hash,
     ]);
     await kv.delete(["parkrun-events", "v1", "revision-id", legacy.hash, 100]);
@@ -870,6 +876,18 @@ Deno.test("KvArchive self-heals unindexed legacy revisions during lookupMany", a
     ]);
     assertExists(idKeyCheck.value);
 
+    const idIndexedKeyCheck = await kv.get([
+      "parkrun-events",
+      "v1",
+      "revision-id-indexed",
+      legacy.hash,
+    ]);
+    assertExists(idIndexedKeyCheck.value);
+
+    // Countries index is self-healed on access without slowing down ID lookups
+    const countries = await archive.getCountries("2026-01-06");
+    assertEquals(countries.length > 0, true);
+
     const countryKeyCheck = await kv.get([
       "parkrun-events",
       "v1",
@@ -893,8 +911,10 @@ Deno.test("KvArchive backfillIndexes idempotently indexes historical observation
 
     // Remove the new keys to simulate legacy state
     await kv.delete(["parkrun-events", "v1", "revision-countries", rev1.hash]);
+    await kv.delete(["parkrun-events", "v1", "revision-id-indexed", rev1.hash]);
     await kv.delete(["parkrun-events", "v1", "revision-id", rev1.hash, 1]);
     await kv.delete(["parkrun-events", "v1", "revision-countries", rev2.hash]);
+    await kv.delete(["parkrun-events", "v1", "revision-id-indexed", rev2.hash]);
     await kv.delete(["parkrun-events", "v1", "revision-id", rev2.hash, 1]);
     await kv.delete(["parkrun-events", "v1", "revision-id", rev2.hash, 2]);
 
