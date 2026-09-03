@@ -620,6 +620,19 @@ Deno.test("GraphQL supports standard schema introspection", async () => {
     );
     assertEquals(result.errors, undefined);
     assertExists(result.data);
+    const schemaData = result.data as {
+      __schema: {
+        types: Array<{
+          name: string;
+          fields?: Array<{ name: string; description: string | null }>;
+        }>;
+      };
+    };
+    const queryType = schemaData.__schema.types.find(
+      (t) => t.name === "Query",
+    );
+    const eventField = queryType?.fields?.find((f) => f.name === "event");
+    assertExists(eventField?.description);
   } finally {
     kv.close();
   }

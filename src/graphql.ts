@@ -43,157 +43,303 @@ const MAX_SOURCE_DEPTH = 64;
 const MAX_SELECTION_DEPTH = 64;
 
 const typeDefs = /* GraphQL */ `
+  """A calendar date string formatted as YYYY-MM-DD in UTC."""
   scalar Date
+
+  """An exact UTC timestamp in ISO 8601 format."""
   scalar DateTime
 
+  """Root queries for historical parkrun event catalogue metadata."""
   type Query {
-    countries(asOf: Date): [CountryInfo!]!
+    """
+    Lists active parkrun countries with official website URLs and active event counts.
+    Optionally accepts an asOf date to view historical country metadata.
+    """
+    countries(
+      """Historical UTC date to resolve countries for. Defaults to the latest observation."""
+      asOf: Date
+    ): [CountryInfo!]!
+
+    """
+    Looks up a single parkrun event by numeric ID, slug, or both as of a specific UTC date.
+    """
     event(
+      """The stable numeric event identifier."""
       id: Int
+      """The unique URL slug for the event (e.g. 'bushy')."""
       slug: String
+      """The target historical UTC date in YYYY-MM-DD format."""
       asOf: Date!
+      """
+      When true (default), queries before the archive start date resolve to the earliest known baseline observation.
+      When false, pre-archive dates return NO_ARCHIVE_COVERAGE.
+      """
       fallbackToEarliest: Boolean = true
     ): EventLookup!
-    events(inputs: [EventLookupInput!]!): [EventLookup!]!
+
+    """
+    Performs batch lookup of up to 100 independent event ID or slug inputs across dates in a single request.
+    Results preserve input order, length, and duplicates.
+    """
+    events(
+      """Ordered list of event lookup inputs (up to 100 items)."""
+      inputs: [EventLookupInput!]!
+    ): [EventLookup!]!
+
+    """
+    Returns non-empty catalogue change sets in chronological order.
+    Shows events that appeared, disappeared, or were updated over time.
+    """
     catalogueChanges(
+      """Filter changes to a specific country code. Omit for global changes."""
       countryCode: Int = null
+      """Inclusive start date for change history."""
       from: Date
+      """Inclusive end date for change history."""
       through: Date
+      """Number of change sets to return (1-100, default 20)."""
       first: Int = 20
+      """Opaque cursor for forward pagination."""
       after: String
     ): CatalogueChangeConnection!
+
+    """
+    Returns the complete chronological transition history for one numeric event ID.
+    Follows renames, moves, and disappearances over time.
+    """
     eventChanges(
+      """The numeric event ID to trace history for."""
       eventId: Int!
+      """Inclusive start date for change history."""
       from: Date
+      """Inclusive end date for change history."""
       through: Date
+      """Number of transitions to return (1-100, default 20)."""
       first: Int = 20
+      """Opaque cursor for forward pagination."""
       after: String
     ): EventChangeHistoryConnection!
+
+    """
+    Metadata about the archive boundaries, including baseline date, latest observation date,
+    total event count, and active country codes.
+    """
     archiveInfo: ArchiveInfo!
   }
 
+  """Input specification for an event lookup item in a batch."""
   input EventLookupInput {
+    """The stable numeric event identifier."""
     id: Int
+    """The unique URL slug for the event."""
     slug: String
+    """The target historical UTC date in YYYY-MM-DD format."""
     asOf: Date!
+    """Whether to fall back to the earliest observation for dates prior to the archive start."""
     fallbackToEarliest: Boolean = true
   }
 
+  """Outcome status of an event lookup."""
   enum EventLookupStatus {
+    """The event existed in the selected observation."""
     FOUND
+    """The observation date is covered by the archive, but the event did not exist."""
     NOT_FOUND
+    """The requested date is earlier than the archive start date and fallbackToEarliest was false."""
     NO_ARCHIVE_COVERAGE
   }
 
+  """Result of looking up an event on a specific date."""
   type EventLookup {
+    """Status indicating whether the event was found in the archive."""
     status: EventLookupStatus!
+    """The numeric ID requested, if specified."""
     requestedId: Int
+    """The slug requested, if specified."""
     requestedSlug: String
+    """The date requested in the input."""
     requestedDate: Date!
+    """The actual catalogue observation used to resolve this lookup."""
     observation: Observation
+    """Event metadata as it existed on the observation date, or null if not found."""
     event: Event
   }
 
+  """Summary information for an active parkrun country."""
   type CountryInfo {
+    """Numeric country identifier (e.g. 97 for UK, 3 for Australia)."""
     code: Int!
+    """Official parkrun website URL for this country."""
     url: String!
+    """Number of active events in this country as of the observation date."""
     eventCount: Int!
   }
 
+  """A recorded snapshot of the public parkrun event catalogue."""
   type Observation {
+    """UTC calendar date of the observation in YYYY-MM-DD format."""
     date: Date!
+    """Exact ISO 8601 timestamp when the catalogue was fetched from the source."""
     fetchedAt: DateTime!
   }
 
+  """Normalized metadata for a parkrun event."""
   type Event {
+    """Stable numeric identifier for the event across name and slug changes."""
     id: Int!
+    """URL slug identifying the event (e.g. 'bushy')."""
     slug: String!
+    """Full official event name (e.g. 'Bushy parkrun')."""
     name: String!
+    """Short display name without prefix or suffix (e.g. 'Bushy Park')."""
     shortName: String!
+    """Country-localised event name, if present in the source."""
     localisedName: String
+    """General geographic location description."""
     location: String!
+    """WGS84 latitude coordinate."""
     latitude: Float!
+    """WGS84 longitude coordinate."""
     longitude: Float!
+    """Numeric country identifier where the event takes place."""
     countryCode: Int!
+    """Base website URL for the event's country."""
     countryUrl: String!
+    """Event series identifier (1 for standard 5k Saturday parkrun, 2 for 2k junior Sunday parkrun)."""
     seriesId: Int!
+    """Full public web page URL for this event."""
     url: String!
   }
 
+  """Global status and coverage boundaries of the archive."""
   type ArchiveInfo {
+    """The earliest accepted observation recorded in the archive (baseline)."""
     firstObservation: Observation
+    """The most recent accepted observation recorded in the archive (head)."""
     latestObservation: Observation
+    """Total active event count as of the latest observation."""
     latestEventCount: Int
+    """Active country code integers as of the latest observation."""
     latestCountryCodes: [Int!]!
   }
 
+  """Paginated connection of catalogue change sets."""
   type CatalogueChangeConnection {
+    """List of catalogue change sets in chronological order."""
     nodes: [CatalogueChange!]!
+    """Pagination cursor information."""
     pageInfo: PageInfo!
   }
 
+  """A transition between two consecutive catalogue observations."""
   type CatalogueChange {
+    """The newer observation resulting from this transition."""
     observation: Observation!
+    """The preceding observation before this transition."""
     previousObservation: Observation!
+    """Counts of appeared, disappeared, and updated events in this change."""
     counts: ChangeCounts!
+    """True if this transition was unusually large and held back until confirmed by a later valid fetch."""
     confirmedAnomaly: Boolean!
+    """Events that appeared for the first time or reappeared on this date."""
     appeared(first: Int = 50, after: String): EventChangeConnection!
+    """Events that were removed from the catalogue on this date."""
     disappeared(first: Int = 50, after: String): EventChangeConnection!
+    """Events whose retained metadata changed on this date."""
     updated(first: Int = 50, after: String): EventChangeConnection!
   }
 
+  """Summary counts of event transitions in a catalogue change."""
   type ChangeCounts {
+    """Number of events that appeared on this date."""
     appeared: Int!
+    """Number of events that disappeared on this date."""
     disappeared: Int!
+    """Number of events whose metadata was updated on this date."""
     updated: Int!
   }
 
+  """Paginated connection of individual event changes."""
   type EventChangeConnection {
+    """List of event changes."""
     nodes: [EventChange!]!
+    """Pagination cursor information."""
     pageInfo: PageInfo!
   }
 
+  """Details of an event appearance, disappearance, or update."""
   type EventChange {
+    """The numeric event ID."""
     id: Int!
+    """Event metadata prior to the change, or null if the event appeared."""
     before: Event
+    """Event metadata after the change, or null if the event disappeared."""
     after: Event
+    """List of fields that changed during this transition."""
     changedFields: [EventField!]!
   }
 
+  """Paginated connection of chronological transitions for a single event."""
   type EventChangeHistoryConnection {
+    """Chronological list of transitions for this event."""
     nodes: [EventChangeHistory!]!
+    """Pagination cursor information."""
     pageInfo: PageInfo!
   }
 
+  """A single historical transition for an event."""
   type EventChangeHistory {
+    """The kind of transition: APPEARED, DISAPPEARED, or UPDATED."""
     kind: EventChangeKind!
+    """The observation date when this transition was recorded."""
     observation: Observation!
+    """The preceding observation date."""
     previousObservation: Observation!
+    """Event metadata before the transition, or null if it appeared."""
     before: Event
+    """Event metadata after the transition, or null if it disappeared."""
     after: Event
+    """Specific metadata fields that changed."""
     changedFields: [EventField!]!
+    """True if this transition was part of a confirmed mass-change anomaly."""
     confirmedAnomaly: Boolean!
   }
 
+  """Classification of an event transition."""
   enum EventChangeKind {
+    """The event was added to the catalogue or reappeared."""
     APPEARED
+    """The event was removed from the catalogue."""
     DISAPPEARED
+    """One or more metadata fields of the event were modified."""
     UPDATED
   }
 
+  """Specific event metadata fields that can change between observations."""
   enum EventField {
+    """The URL slug changed (event was renamed)."""
     SLUG
+    """The full event name changed."""
     NAME
+    """The short display name changed."""
     SHORT_NAME
+    """The country-localised name changed."""
     LOCALISED_NAME
+    """The location description changed."""
     LOCATION
+    """Latitude or longitude coordinates changed."""
     COORDINATES
+    """The event moved between countries."""
     COUNTRY
+    """The event series changed (e.g. 5k to junior)."""
     SERIES
   }
 
+  """Pagination metadata for cursor-based connections."""
   type PageInfo {
+    """Cursor string for the last item in this page, used as 'after' for the next page."""
     endCursor: String
+    """True if there are additional items following this page."""
     hasNextPage: Boolean!
   }
 `;
