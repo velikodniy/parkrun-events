@@ -32,7 +32,6 @@ Deno.test("GraphQL endpoint serves GraphiQL", async () => {
     assertEquals(response.status, 200);
     const html = await response.text();
     assertStringIncludes(html, "parkrun events archive");
-    assertStringIncludes(html, "defaultTabs");
     assertStringIncludes(html, "ArchiveOverview");
   } finally {
     kv.close();

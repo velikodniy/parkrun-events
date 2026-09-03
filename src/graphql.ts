@@ -764,8 +764,8 @@ export function createGraphqlServer(
     graphqlEndpoint: "/graphql",
     graphiql: {
       title: "parkrun events archive",
-      defaultQuery: DEFAULT_GRAPHIQL_TABS[0]!.query,
-      defaultTabs: DEFAULT_GRAPHIQL_TABS,
+      defaultQuery: DEFAULT_GRAPHIQL_QUERY,
+      ...({ query: DEFAULT_GRAPHIQL_QUERY } as Record<string, unknown>),
     },
     cors: { origin: "*" },
     maskedErrors: true,
@@ -773,10 +773,10 @@ export function createGraphqlServer(
   });
 }
 
-const DEFAULT_GRAPHIQL_TABS = [
-  {
-    query:
-      `# 1. Archive Overview: observation dates, event count, and active countries
+const DEFAULT_GRAPHIQL_QUERY = `# Welcome to the parkrun events archive!
+# Choose an operation from the run button dropdown, or press Cmd+Enter on any query.
+
+# 1. Archive Overview: observation dates, event count, and active countries
 query ArchiveOverview {
   archiveInfo {
     firstObservation {
@@ -789,10 +789,8 @@ query ArchiveOverview {
     latestCountryCodes
   }
 }
-`,
-  },
-  {
-    query: `# 2. Single Event Lookup by numeric ID or slug as of a specific date
+
+# 2. Single Event Lookup by numeric ID or slug as of a specific date
 query SingleEvent {
   event(id: 1, asOf: "2026-08-01") {
     status
@@ -814,13 +812,17 @@ query SingleEvent {
     }
   }
 }
-`,
-  },
-  {
-    query:
-      `# 3. Batch Lookup: multiple IDs and slugs across dates in one request
-query BatchLookup($inputs: [EventLookupInput!]!) {
-  events(inputs: $inputs) {
+
+# 3. Batch Lookup: multiple IDs and slugs across historical dates
+query BatchLookup {
+  events(
+    inputs: [
+      { id: 1, asOf: "2026-08-01" }
+      { id: 76, asOf: "2026-08-29" }
+      { slug: "bushy", asOf: "2026-08-01" }
+      { id: 105, slug: "wimbledon", asOf: "2026-08-15" }
+    ]
+  ) {
     status
     requestedId
     requestedSlug
@@ -836,23 +838,8 @@ query BatchLookup($inputs: [EventLookupInput!]!) {
     }
   }
 }
-`,
-    variables: JSON.stringify(
-      {
-        inputs: [
-          { id: 1, asOf: "2026-08-01" },
-          { id: 76, asOf: "2026-08-29" },
-          { slug: "bushy", asOf: "2026-08-01" },
-          { id: 105, slug: "wimbledon", asOf: "2026-08-15" },
-        ],
-      },
-      null,
-      2,
-    ),
-  },
-  {
-    query:
-      `# 4. Countries: active countries, official websites, and event counts
+
+# 4. Countries: active countries, official websites, and event counts
 query ActiveCountries {
   countries {
     code
@@ -860,11 +847,8 @@ query ActiveCountries {
     eventCount
   }
 }
-`,
-  },
-  {
-    query:
-      `# 5. Event History: follow all historical updates/renames for an event ID
+
+# 5. Event History: follow all historical updates/renames for an event ID
 query EventHistory {
   eventChanges(eventId: 105, first: 10) {
     nodes {
@@ -888,9 +872,7 @@ query EventHistory {
     }
   }
 }
-`,
-  },
-];
+`;
 
 function sourceLimitsPlugin() {
   return {
