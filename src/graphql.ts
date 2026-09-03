@@ -616,12 +616,135 @@ export function createGraphqlServer(
     }),
     plugins: [sourceLimitsPlugin(), operationLimitsPlugin()],
     graphqlEndpoint: "/graphql",
-    graphiql: true,
+    graphiql: {
+      title: "parkrun events archive",
+      defaultQuery: DEFAULT_GRAPHIQL_TABS[0]!.query,
+      defaultTabs: DEFAULT_GRAPHIQL_TABS,
+    },
     cors: { origin: "*" },
     maskedErrors: true,
     logging: false,
   });
 }
+
+const DEFAULT_GRAPHIQL_TABS = [
+  {
+    query:
+      `# 1. Archive Overview: observation dates, event count, and active countries
+query ArchiveOverview {
+  archiveInfo {
+    firstObservation {
+      date
+    }
+    latestObservation {
+      date
+    }
+    latestEventCount
+    latestCountryCodes
+  }
+}
+`,
+  },
+  {
+    query: `# 2. Single Event Lookup by numeric ID or slug as of a specific date
+query SingleEvent {
+  event(id: 1, asOf: "2026-08-01") {
+    status
+    requestedId
+    requestedSlug
+    requestedDate
+    observation {
+      date
+    }
+    event {
+      id
+      slug
+      name
+      shortName
+      location
+      countryCode
+      countryUrl
+      url
+    }
+  }
+}
+`,
+  },
+  {
+    query:
+      `# 3. Batch Lookup: multiple IDs and slugs across dates in one request
+query BatchLookup($inputs: [EventLookupInput!]!) {
+  events(inputs: $inputs) {
+    status
+    requestedId
+    requestedSlug
+    requestedDate
+    observation {
+      date
+    }
+    event {
+      id
+      slug
+      name
+      shortName
+    }
+  }
+}
+`,
+    variables: JSON.stringify(
+      {
+        inputs: [
+          { id: 1, asOf: "2026-08-01" },
+          { id: 76, asOf: "2026-08-29" },
+          { slug: "bushy", asOf: "2026-08-01" },
+          { id: 105, slug: "wimbledon", asOf: "2026-08-15" },
+        ],
+      },
+      null,
+      2,
+    ),
+  },
+  {
+    query:
+      `# 4. Countries: active countries, official websites, and event counts
+query ActiveCountries {
+  countries {
+    code
+    url
+    eventCount
+  }
+}
+`,
+  },
+  {
+    query:
+      `# 5. Event History: follow all historical updates/renames for an event ID
+query EventHistory {
+  eventChanges(eventId: 105, first: 10) {
+    nodes {
+      kind
+      observation {
+        date
+      }
+      changedFields
+      before {
+        slug
+        name
+      }
+      after {
+        slug
+        name
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+`,
+  },
+];
 
 function sourceLimitsPlugin() {
   return {
