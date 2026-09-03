@@ -243,5 +243,8 @@ so coverage before that date depends on trustworthy dated snapshots.
 ## Indexing
 
 The archive indexes numeric event IDs and active country counts per revision.
-Existing historical revisions in KV that were created prior to this indexing are
-self-healed automatically on first access during queries.
+Indexes are populated in Deno KV upon daily ingestion of new data. Point reads
+for numeric IDs (`revision-id`) and country metadata (`revision-countries`)
+resolve directly via indexed lookups. Any unindexed historical revisions are
+self-healed efficiently on first access from bucket entries without scanning
+full event records.
